@@ -298,3 +298,10 @@ class FileIndexer:
         for paths in self.file_index.values():
             unique_paths.update(paths)
         return len(unique_paths)
+
+    def get_all_files(self) -> List[str]:
+        """Return a sorted list of all indexed file paths."""
+        unique_paths: Set[str] = set()
+        for paths in self.file_index.values():
+            unique_paths.update(paths)
+        return sorted(unique_paths)
