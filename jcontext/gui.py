@@ -3,7 +3,11 @@ Main GUI module for the JContext application.
 """
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
+from tkinter import ttk, filedialog, messagebox, scrolledtext, font
+try:
+    from ttkthemes import ThemedTk
+except ImportError:  # Fallback if ttkthemes is not installed
+    ThemedTk = None
 import threading
 import os
 import sys
@@ -12,6 +16,7 @@ from .file_indexer import FileIndexer
 from .history_manager import HistoryManager
 from .content_processor import ContentProcessor
 from .project_manager import ProjectManager
+from .global_settings import GlobalSettings
 
 # Try to import pyperclip, provide fallback if not available
 try:
@@ -22,89 +27,108 @@ except ImportError:
 
 
 class SettingsDialog:
-    """Settings dialog for configuring ignore directories and file extensions."""
-    
-    def __init__(self, parent, file_indexer: FileIndexer):
+    """Settings dialog for project and global settings."""
+
+    def __init__(self, parent, file_indexer: FileIndexer, global_settings: GlobalSettings):
         self.parent = parent
         self.file_indexer = file_indexer
+        self.global_settings = global_settings
         self.result = None
         
     def show(self):
         """Show the settings dialog."""
         self.dialog = tk.Toplevel(self.parent)
         self.dialog.title("Settings")
-        self.dialog.geometry("600x500")
+        self.dialog.geometry("600x520")
         self.dialog.transient(self.parent)
         self.dialog.grab_set()
-        
+
         # Center the dialog
         self.dialog.update_idletasks()
         x = (self.dialog.winfo_screenwidth() // 2) - (600 // 2)
-        y = (self.dialog.winfo_screenheight() // 2) - (500 // 2)
-        self.dialog.geometry(f"600x500+{x}+{y}")
-        
-        # Main frame
+        y = (self.dialog.winfo_screenheight() // 2) - (520 // 2)
+        self.dialog.geometry(f"600x520+{x}+{y}")
+
         main_frame = ttk.Frame(self.dialog, padding=10)
         main_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Ignored directories section
-        ignore_frame = ttk.LabelFrame(main_frame, text="Ignored Directories", padding=5)
+
+        notebook = ttk.Notebook(main_frame)
+        notebook.pack(fill=tk.BOTH, expand=True)
+
+        # Project settings tab
+        proj_tab = ttk.Frame(notebook)
+        notebook.add(proj_tab, text="Project")
+
+        ignore_frame = ttk.LabelFrame(proj_tab, text="Ignored Directories", padding=5)
         ignore_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
-        
         ttk.Label(ignore_frame, text="Directories to ignore during indexing (one per line):").pack(anchor=tk.W)
-        
         self.ignore_text = scrolledtext.ScrolledText(ignore_frame, height=8)
         self.ignore_text.pack(fill=tk.BOTH, expand=True, pady=5)
-        
-        # Load current ignored directories
         ignore_dirs = '\n'.join(sorted(self.file_indexer.ignored_dirs))
         self.ignore_text.insert('1.0', ignore_dirs)
-        
-        # File extensions section
-        ext_frame = ttk.LabelFrame(main_frame, text="Indexed File Extensions", padding=5)
+
+        ext_frame = ttk.LabelFrame(proj_tab, text="Indexed File Extensions", padding=5)
         ext_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
-        
         ttk.Label(ext_frame, text="File extensions to index (one per line, include the dot):").pack(anchor=tk.W)
-        
         self.ext_text = scrolledtext.ScrolledText(ext_frame, height=8)
         self.ext_text.pack(fill=tk.BOTH, expand=True, pady=5)
-        
-        # Load current extensions
         extensions = '\n'.join(sorted(self.file_indexer.indexed_extensions))
         self.ext_text.insert('1.0', extensions)
-        
-        # Buttons
+
+        # Global settings tab
+        glob_tab = ttk.Frame(notebook)
+        notebook.add(glob_tab, text="Global")
+
+        storage_frame = ttk.LabelFrame(glob_tab, text="Storage Directory", padding=5)
+        storage_frame.pack(fill=tk.X, pady=(0, 10))
+        self.storage_var = tk.StringVar(value=self.global_settings.app_data_dir)
+        ttk.Entry(storage_frame, textvariable=self.storage_var, width=40).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(storage_frame, text="Browse", command=self.browse_storage).pack(side=tk.LEFT, padx=5)
+
+        theme_frame = ttk.LabelFrame(glob_tab, text="Theme and Font", padding=5)
+        theme_frame.pack(fill=tk.X, pady=(0, 10))
+        themes = []
+        if ThemedTk:
+            try:
+                themes = sorted(ThemedTk().get_themes())
+            except Exception:
+                themes = []
+        self.theme_var = tk.StringVar(value=self.global_settings.settings.get("theme", "clam"))
+        ttk.Label(theme_frame, text="Theme:").pack(side=tk.LEFT)
+        ttk.Combobox(theme_frame, values=themes, textvariable=self.theme_var, width=15).pack(side=tk.LEFT, padx=5)
+        self.font_var = tk.StringVar(value=self.global_settings.settings.get("font_family", "Arial"))
+        self.font_size_var = tk.IntVar(value=self.global_settings.settings.get("font_size", 10))
+        ttk.Label(theme_frame, text="Font:").pack(side=tk.LEFT)
+        ttk.Entry(theme_frame, textvariable=self.font_var, width=12).pack(side=tk.LEFT, padx=5)
+        ttk.Label(theme_frame, text="Size:").pack(side=tk.LEFT)
+        ttk.Spinbox(theme_frame, from_=6, to=32, textvariable=self.font_size_var, width=5).pack(side=tk.LEFT)
+
+        default_frame = ttk.LabelFrame(glob_tab, text="Defaults for New Projects", padding=5)
+        default_frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(default_frame, text="Ignored Dirs (one per line):").pack(anchor=tk.W)
+        self.default_ignore_text = scrolledtext.ScrolledText(default_frame, height=4)
+        self.default_ignore_text.pack(fill=tk.BOTH, expand=True, pady=(0,5))
+        self.default_ignore_text.insert('1.0', '\n'.join(sorted(self.global_settings.default_ignored_dirs)))
+        ttk.Label(default_frame, text="Indexed Extensions (one per line):").pack(anchor=tk.W)
+        self.default_ext_text = scrolledtext.ScrolledText(default_frame, height=4)
+        self.default_ext_text.pack(fill=tk.BOTH, expand=True)
+        self.default_ext_text.insert('1.0', '\n'.join(sorted(self.global_settings.default_indexed_extensions)))
+
         button_frame = ttk.Frame(main_frame)
         button_frame.pack(fill=tk.X, pady=(10, 0))
-        
         ttk.Button(button_frame, text="Cancel", command=self.cancel).pack(side=tk.RIGHT)
         ttk.Button(button_frame, text="Apply", command=self.apply).pack(side=tk.RIGHT, padx=(0, 5))
-        ttk.Button(button_frame, text="Reset to Defaults", command=self.reset_defaults).pack(side=tk.LEFT)
-        
-        # Wait for dialog to close
+
         self.parent.wait_window(self.dialog)
         return self.result
         
     def reset_defaults(self):
         """Reset settings to defaults."""
-        default_ignored = {
-            '__pycache__', '.git', '.svn', '.hg', '.vscode', '.idea',
-            'node_modules', '.env', 'venv', '.venv', 'env', 'ENV',
-            'dist', 'build', 'target', 'bin', 'obj', '.pytest_cache'
-        }
-        
-        default_extensions = {
-            '.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.cpp', '.c', '.h',
-            '.cs', '.php', '.rb', '.go', '.rs', '.swift', '.kt', '.scala',
-            '.html', '.css', '.scss', '.less', '.xml', '.json', '.yaml', '.yml',
-            '.md', '.txt', '.rst', '.sql', '.sh', '.bat', '.ps1', '.r', '.m'
-        }
-        
         self.ignore_text.delete('1.0', tk.END)
-        self.ignore_text.insert('1.0', '\n'.join(sorted(default_ignored)))
-        
+        self.ignore_text.insert('1.0', '\n'.join(sorted(self.global_settings.default_ignored_dirs)))
+
         self.ext_text.delete('1.0', tk.END)
-        self.ext_text.insert('1.0', '\n'.join(sorted(default_extensions)))
+        self.ext_text.insert('1.0', '\n'.join(sorted(self.global_settings.default_indexed_extensions)))
         
     def apply(self):
         """Apply the settings."""
@@ -129,9 +153,32 @@ class SettingsDialog:
         # Apply to file indexer
         self.file_indexer.ignored_dirs = ignored_dirs
         self.file_indexer.indexed_extensions = extensions
-        
+
+        # Global settings
+        self.global_settings.settings["app_data_dir"] = self.storage_var.get()
+        self.global_settings.settings["theme"] = self.theme_var.get()
+        self.global_settings.settings["font_family"] = self.font_var.get()
+        self.global_settings.settings["font_size"] = int(self.font_size_var.get())
+        default_ign = self.default_ignore_text.get('1.0', tk.END).strip().split('\n')
+        self.global_settings.settings["default_ignored_dirs"] = [d.strip() for d in default_ign if d.strip()]
+        default_ext = self.default_ext_text.get('1.0', tk.END).strip().split('\n')
+        cleaned_ext = []
+        for ext in default_ext:
+            ext = ext.strip()
+            if ext:
+                if not ext.startswith('.'):
+                    ext = '.' + ext
+                cleaned_ext.append(ext.lower())
+        self.global_settings.settings["default_indexed_extensions"] = cleaned_ext
+        self.global_settings.save()
+
         self.result = True
         self.dialog.destroy()
+
+    def browse_storage(self):
+        directory = filedialog.askdirectory(title="Select Storage Directory")
+        if directory:
+            self.storage_var.set(directory)
         
     def cancel(self):
         """Cancel the dialog."""
@@ -225,14 +272,31 @@ class AutocompletePopup:
 
 class JContextGUI:
     """Main GUI application class."""
-    
+
     def __init__(self):
-        self.root = tk.Tk()
+        self.global_settings = GlobalSettings()
+        if ThemedTk:
+            self.root = ThemedTk(theme=self.global_settings.settings.get("theme", "clam"))
+        else:
+            self.root = tk.Tk()
+            try:
+                style = ttk.Style(self.root)
+                style.theme_use(self.global_settings.settings.get("theme", "clam"))
+            except Exception:
+                pass
         self.root.title("JContext - LLM Context Generator")
         self.root.geometry("1200x800")
-        
+
+        default_family = self.global_settings.settings.get("font_family", "Arial")
+        default_size = int(self.global_settings.settings.get("font_size", 10))
+        try:
+            font.nametofont("TkDefaultFont").configure(family=default_family, size=default_size)
+            font.nametofont("TkTextFont").configure(family=default_family, size=default_size)
+        except Exception:
+            pass
+
         # Initialize components
-        self.project_manager = ProjectManager()
+        self.project_manager = ProjectManager(self.global_settings)
         self.file_indexer = FileIndexer()
         self.content_processor = ContentProcessor(self.file_indexer)
         self.autocomplete_popup = None
@@ -326,7 +390,6 @@ class JContextGUI:
         
         ttk.Button(proj_select_frame, text="New Project", command=self.select_new_project).pack(side=tk.RIGHT, padx=(5, 0))
         ttk.Button(proj_select_frame, text="Refresh", command=self.refresh_index).pack(side=tk.RIGHT, padx=(5, 0))
-        ttk.Button(proj_select_frame, text="Settings", command=self.show_settings).pack(side=tk.RIGHT, padx=(5, 0))
         
         # Current path display
         ttk.Label(project_frame, text="Path:").pack(anchor=tk.W, pady=(5, 0))
@@ -364,13 +427,11 @@ class JContextGUI:
         text_frame = ttk.Frame(editor_frame)
         text_frame.pack(fill=tk.BOTH, expand=True, pady=2)
         
-        # Use a more common font system
-        default_font = ('Arial', 10)
-        try:
-            # Try to use system default monospace font
-            default_font = ('Courier New', 10)
-        except:
-            pass
+        # Use global font settings
+        default_font = (
+            self.global_settings.settings.get("font_family", "Arial"),
+            int(self.global_settings.settings.get("font_size", 10))
+        )
         
         self.text_editor = scrolledtext.ScrolledText(
             text_frame,
@@ -473,13 +534,9 @@ class JContextGUI:
         
     def show_settings(self):
         """Show the settings dialog."""
-        if not self.project_manager.get_current_project():
-            messagebox.showwarning("Warning", "Please select a project first")
-            return
-            
-        dialog = SettingsDialog(self.root, self.file_indexer)
+        dialog = SettingsDialog(self.root, self.file_indexer, self.global_settings)
         result = dialog.show()
-        
+
         if result:
             # Save settings to current project
             current_project = self.project_manager.get_current_project()
@@ -490,7 +547,9 @@ class JContextGUI:
                 }
                 self.project_manager.update_project_settings(current_project['id'], settings)
             
+            self.project_manager.set_app_data_dir(self.global_settings.app_data_dir)
             # Refresh index with new settings
+            self.apply_global_settings()
             self.refresh_index()
             self.status_text.set("Settings applied - index refreshed")
         
@@ -968,7 +1027,7 @@ class JContextGUI:
             
     def show_about(self):
         """Show about dialog."""
-        messagebox.showinfo("About", 
+        messagebox.showinfo("About",
                            "JContext - LLM Context Generator\n\n"
                            "A tool for creating LLM prompts with embedded file content.\n\n"
                            "Features:\n"
@@ -976,7 +1035,29 @@ class JContextGUI:
                            "• Arrow keys to navigate suggestions\n"
                            "• Render mode to preview/edit content\n"
                            "• Configurable settings\n"
-                           "• Ctrl+Enter to copy content")
+                          "• Ctrl+Enter to copy content")
+
+    def apply_global_settings(self):
+        """Apply theme, fonts and storage directory from global settings."""
+        if ThemedTk and isinstance(self.root, ThemedTk):
+            try:
+                self.root.set_theme(self.global_settings.settings.get("theme", "clam"))
+            except Exception:
+                pass
+        else:
+            try:
+                style = ttk.Style(self.root)
+                style.theme_use(self.global_settings.settings.get("theme", "clam"))
+            except Exception:
+                pass
+        family = self.global_settings.settings.get("font_family", "Arial")
+        size = int(self.global_settings.settings.get("font_size", 10))
+        try:
+            font.nametofont("TkDefaultFont").configure(family=family, size=size)
+            font.nametofont("TkTextFont").configure(family=family, size=size)
+        except Exception:
+            pass
+        self.project_manager.set_app_data_dir(self.global_settings.app_data_dir)
         
     def run(self):
         """Run the application."""
