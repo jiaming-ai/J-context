@@ -15,6 +15,7 @@ class GlobalSettings:
             "theme": "clam",
             "font_family": "Arial",
             "font_size": 10,
+            "opened_projects": [],  # Store list of opened project IDs
             "default_ignored_dirs": [
                 "__pycache__", ".git", ".svn", ".hg", ".vscode", ".idea",
                 "node_modules", ".env", "venv", ".venv", "env", "ENV",
@@ -65,3 +66,26 @@ class GlobalSettings:
     @property
     def default_indexed_extensions(self) -> List[str]:
         return list(self.settings.get("default_indexed_extensions", []))
+    
+    def get_opened_projects(self) -> List[str]:
+        """Get list of opened project IDs."""
+        return list(self.settings.get("opened_projects", []))
+    
+    def set_opened_projects(self, project_ids: List[str]):
+        """Set list of opened project IDs."""
+        self.settings["opened_projects"] = list(project_ids)
+        self.save()
+    
+    def add_opened_project(self, project_id: str):
+        """Add a project to the opened projects list."""
+        opened = self.get_opened_projects()
+        if project_id not in opened:
+            opened.append(project_id)
+            self.set_opened_projects(opened)
+    
+    def remove_opened_project(self, project_id: str):
+        """Remove a project from the opened projects list."""
+        opened = self.get_opened_projects()
+        if project_id in opened:
+            opened.remove(project_id)
+            self.set_opened_projects(opened)

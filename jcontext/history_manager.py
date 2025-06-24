@@ -79,6 +79,18 @@ class HistoryManager:
         prompt = self.get_prompt(prompt_id)
         return prompt.get("text") if prompt else None
     
+    def update_prompt(self, prompt_id: str, prompt_text: str, title: Optional[str] = None) -> bool:
+        """Update an existing prompt."""
+        for prompt in self.history:
+            if prompt.get("id") == prompt_id:
+                prompt["text"] = prompt_text
+                prompt["preview"] = prompt_text[:100] + ("..." if len(prompt_text) > 100 else "")
+                if title is not None:
+                    prompt["title"] = title
+                self.save_history()
+                return True
+        return False
+    
     def get_all_prompts(self) -> List[Dict]:
         """Get all prompts (ordered by most recent first)."""
         return self.history.copy()
@@ -109,6 +121,10 @@ class HistoryManager:
         """Clear all history."""
         self.history = []
         self.save_history()
+    
+    def clear_all(self):
+        """Alias for clear_history for compatibility."""
+        self.clear_history()
     
     def search_prompts(self, query: str) -> List[Dict]:
         """Search prompts by text content."""

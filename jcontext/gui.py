@@ -11,6 +11,7 @@ except ImportError:  # Fallback if ttkthemes is not installed
 import threading
 import os
 import sys
+import platform
 from typing import Optional, List
 from .file_indexer import FileIndexer
 from .history_manager import HistoryManager
@@ -96,7 +97,7 @@ class SettingsDialog:
         self.theme_var = tk.StringVar(value=self.global_settings.settings.get("theme", "clam"))
         ttk.Label(theme_frame, text="Theme:").pack(side=tk.LEFT)
         ttk.Combobox(theme_frame, values=themes, textvariable=self.theme_var, width=15).pack(side=tk.LEFT, padx=5)
-        self.font_var = tk.StringVar(value=self.global_settings.settings.get("font_family", "Arial"))
+        self.font_var = tk.StringVar(value=self.global_settings.settings.get("font_family", "DejaVu Sans"))
         self.font_size_var = tk.IntVar(value=self.global_settings.settings.get("font_size", 10))
         ttk.Label(theme_frame, text="Font:").pack(side=tk.LEFT)
         ttk.Entry(theme_frame, textvariable=self.font_var, width=12).pack(side=tk.LEFT, padx=5)
@@ -184,6 +185,677 @@ class SettingsDialog:
         """Cancel the dialog."""
         self.result = False
         self.dialog.destroy()
+
+
+class ProjectTab:
+    """Represents a single project tab with its own text editor and components."""
+    
+    def __init__(self, parent_gui, project_id, project_data):
+        self.parent_gui = parent_gui
+        self.project_id = project_id
+        self.project_data = project_data
+        
+        # Initialize project-specific components
+        self.file_indexer = FileIndexer()
+        self.content_processor = ContentProcessor(self.file_indexer)
+        self.autocomplete_popup = None
+        
+        # Project-specific state
+        self.title_text = tk.StringVar()
+        self.render_mode = tk.BooleanVar(value=False)
+        self.raw_text = ""
+        self.rendered_text = ""
+        self.code_block_edits = {}
+        
+        # Auto-save state
+        self.current_history_id = None  # Track if we're editing an existing item
+        self.auto_save_timer = None
+        self.last_saved_content = ""
+        self.last_saved_title = ""
+        
+        # Apply project settings to file indexer
+        settings = project_data.get('settings', {})
+        if 'ignored_dirs' in settings:
+            if isinstance(settings['ignored_dirs'], list):
+                self.file_indexer.ignored_dirs = set(settings['ignored_dirs'])
+            else:
+                self.file_indexer.ignored_dirs = settings['ignored_dirs']
+        if 'indexed_extensions' in settings:
+            if isinstance(settings['indexed_extensions'], list):
+                self.file_indexer.indexed_extensions = set(settings['indexed_extensions'])
+            else:
+                self.file_indexer.indexed_extensions = settings['indexed_extensions']
+        
+        # Set up file indexer
+        if self.file_indexer.set_root_path(project_data['path']):
+            self.file_indexer.set_update_callback(self.on_index_updated)
+            self.file_indexer.set_progress_callback(self.on_index_progress)
+            # Start indexing in background
+            threading.Thread(target=self.file_indexer.refresh_index, daemon=True).start()
+    
+    def create_tab_content(self, parent):
+        """Create the content for this project tab."""
+        # Main content frame (horizontal split)
+        content_frame = ttk.PanedWindow(parent, orient=tk.HORIZONTAL)
+        content_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Left panel - text editor
+        self.setup_text_editor(content_frame)
+        
+        # Right panel - history and controls
+        self.setup_right_panel(content_frame)
+        
+        return content_frame
+    
+    def setup_text_editor(self, parent):
+        """Set up the main text editor for this project."""
+        editor_frame = ttk.Frame(parent)
+        parent.add(editor_frame, weight=3)
+        
+        # Title and prompt label on the same line
+        title_frame = ttk.Frame(editor_frame)
+        title_frame.pack(fill=tk.X, pady=(0, 5))
+
+        ttk.Label(title_frame, text="Title (optional):").pack(side=tk.LEFT)
+        self.title_entry = ttk.Entry(title_frame, textvariable=self.title_text, width=30)
+        self.title_entry.pack(side=tk.LEFT, padx=(5, 10))
+
+        ttk.Label(title_frame, text="Prompt Text (use @ to insert files):").pack(side=tk.LEFT)
+        
+        # Text widget with scrollbar
+        text_frame = ttk.Frame(editor_frame)
+        text_frame.pack(fill=tk.BOTH, expand=True, pady=2)
+        
+        # Use a more conservative font approach for better Linux compatibility
+        default_family = self.parent_gui.get_system_appropriate_font()
+        default_size = int(self.parent_gui.global_settings.settings.get("font_size", 10))
+        
+        try:
+            text_font = font.Font(family=default_family, size=default_size)
+        except:
+            # Fallback to system default
+            text_font = font.nametofont("TkTextFont")
+        
+        self.text_editor = scrolledtext.ScrolledText(
+            text_frame,
+            wrap=tk.WORD,
+            font=text_font,
+            undo=True
+        )
+        self.text_editor.pack(fill=tk.BOTH, expand=True)
+        
+        # Bind events for autocomplete and navigation
+        self.text_editor.bind('<KeyRelease>', self.on_key_release_combined)
+        self.text_editor.bind('<KeyPress>', self.on_key_press)
+        self.text_editor.bind('<Button-1>', self.hide_autocomplete)
+        self.text_editor.bind('<Tab>', self.on_tab_press)
+        self.text_editor.bind('<Control-Shift-Return>', self.copy_with_content)
+        
+        # Bind text change events for auto-save
+        self.title_text.trace('w', self.on_text_changed)
+        
+        # Control buttons
+        button_frame = ttk.Frame(editor_frame)
+        button_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Button(button_frame, text="Copy with Content (Ctrl+Shift+Enter)",
+                  command=self.copy_with_content).pack(side=tk.LEFT)
+        ttk.Button(button_frame, text="New",
+                  command=self.new_prompt).pack(side=tk.LEFT, padx=(5, 0))
+        ttk.Button(button_frame, text="Clear",
+                  command=self.clear_text).pack(side=tk.LEFT, padx=(5, 0))
+
+        # Render toggle aligned to the right
+        self.render_toggle = ttk.Checkbutton(
+            button_frame,
+            text="Render Mode",
+            variable=self.render_mode,
+            command=self.toggle_render_mode
+        )
+        self.render_toggle.pack(side=tk.RIGHT)
+
+        # Statistics
+        self.stats_label = ttk.Label(button_frame, text="")
+        self.stats_label.pack(side=tk.RIGHT, padx=(0, 10))
+        
+        # Set up autocomplete
+        self.autocomplete_popup = AutocompletePopup(self.parent_gui.root, self.text_editor)
+        
+    def setup_right_panel(self, parent):
+        """Set up the right panel with history and file tree."""
+        right_frame = ttk.Frame(parent)
+        parent.add(right_frame, weight=1)
+
+        notebook = ttk.Notebook(right_frame)
+        notebook.pack(fill=tk.BOTH, expand=True)
+
+        # History tab
+        history_tab = ttk.Frame(notebook)
+        notebook.add(history_tab, text="History")
+
+        list_frame = ttk.Frame(history_tab)
+        list_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.history_listbox = tk.Listbox(list_frame)
+        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.history_listbox.yview)
+        self.history_listbox.configure(yscrollcommand=scrollbar.set)
+        self.history_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.history_listbox.bind('<Double-Button-1>', self.load_from_history)
+        self.history_listbox.bind('<Button-3>', self.show_history_context_menu)
+
+        # Remove the button frame - no more Load/Delete buttons
+        # hist_button_frame = ttk.Frame(history_tab)
+        # hist_button_frame.pack(fill=tk.X, pady=5)
+
+        # Files tab
+        files_tab = ttk.Frame(notebook)
+        notebook.add(files_tab, text="Files")
+
+        tree_frame = ttk.Frame(files_tab)
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.files_tree = ttk.Treeview(tree_frame, show='tree')
+        tree_scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.files_tree.yview)
+        self.files_tree.configure(yscrollcommand=tree_scroll.set)
+        self.files_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.files_tree.bind('<Double-Button-1>', self.on_file_double_click)
+
+        # Load history and file tree
+        self.refresh_history()
+        self.refresh_file_tree()
+    
+    def on_text_changed(self, *args):
+        """Handle text change for auto-save (immediate)."""
+        self.schedule_auto_save()
+    
+    def on_text_changed_delayed(self, event):
+        """Handle text change for auto-save (after key release)."""
+        # Call the original on_key_release handler first
+        self.on_key_release(event)
+        self.schedule_auto_save()
+    
+    def on_key_release_combined(self, event):
+        """Combined handler for key release - handles both autocomplete and auto-save."""
+        # Handle autocomplete first
+        self.on_key_release(event)
+        # Then schedule auto-save
+        self.schedule_auto_save()
+    
+    def schedule_auto_save(self):
+        """Schedule auto-save after a delay."""
+        if self.auto_save_timer:
+            self.parent_gui.root.after_cancel(self.auto_save_timer)
+        self.auto_save_timer = self.parent_gui.root.after(2000, self.auto_save)  # 2 second delay
+    
+    def auto_save(self):
+        """Auto-save the current content."""
+        if self.render_mode.get():
+            text = self.raw_text if self.raw_text else self.text_editor.get('1.0', tk.END).strip()
+        else:
+            text = self.text_editor.get('1.0', tk.END).strip()
+            
+        title = self.title_text.get().strip()
+        
+        # Check if content has changed
+        if text == self.last_saved_content and title == self.last_saved_title:
+            return
+            
+        if not text:  # Don't save empty content
+            return
+        
+        # Set current project and get history manager
+        self.parent_gui.project_manager.set_current_project(self.project_id)
+        history_manager = self.parent_gui.project_manager.get_current_history_manager()
+        if history_manager:
+            if self.current_history_id:
+                # Update existing item
+                history_manager.update_prompt(self.current_history_id, text, title)
+            else:
+                # Create new item if we don't have one
+                if not title:
+                    title = "Untitled"
+                self.current_history_id = history_manager.add_prompt(text, self.file_indexer.root_path, title)
+            
+            self.last_saved_content = text
+            self.last_saved_title = title
+            self.refresh_history()
+    
+    def new_prompt(self):
+        """Create a new prompt from fresh."""
+        self.text_editor.delete('1.0', tk.END)
+        self.title_text.set("")
+        self.raw_text = ""
+        self.rendered_text = ""
+        self.code_block_edits = {}
+        self.render_mode.set(False)
+        self.current_history_id = None
+        self.last_saved_content = ""
+        self.last_saved_title = ""
+        self.update_statistics()
+    
+    def show_history_context_menu(self, event):
+        """Show context menu for history items."""
+        # Get the item under the cursor
+        index = self.history_listbox.nearest(event.y)
+        if index < 0:
+            return
+            
+        self.history_listbox.selection_clear(0, tk.END)
+        self.history_listbox.selection_set(index)
+        
+        # Create context menu
+        context_menu = tk.Menu(self.parent_gui.root, tearoff=0)
+        context_menu.add_command(label="Load", command=self.load_from_history)
+        context_menu.add_command(label="Remove", command=self.delete_from_history)
+        context_menu.add_command(label="Copy", command=self.copy_history_item)
+        context_menu.add_command(label="Duplicate", command=self.duplicate_history_item)
+        
+        # Show the menu
+        try:
+            context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            context_menu.grab_release()
+    
+    def copy_history_item(self):
+        """Copy the selected history item to clipboard."""
+        selection = self.history_listbox.curselection()
+        if not selection:
+            return
+            
+        # Set current project and get history manager
+        self.parent_gui.project_manager.set_current_project(self.project_id)
+        history_manager = self.parent_gui.project_manager.get_current_history_manager()
+        if not history_manager:
+            return
+            
+        index = selection[0]
+        previews = history_manager.get_prompt_previews()
+        
+        if index < len(previews):
+            prompt_id = previews[index]['id']
+            prompt_data = history_manager.get_prompt(prompt_id)
+            if prompt_data:
+                text = prompt_data['text']
+                try:
+                    if CLIPBOARD_AVAILABLE:
+                        pyperclip.copy(text)
+                        self.parent_gui.status_text.set("History item copied to clipboard")
+                        messagebox.showinfo("Success", "History item copied to clipboard!")
+                    else:
+                        self.parent_gui.show_processed_content(text)
+                except Exception as e:
+                    messagebox.showerror("Error", f"Failed to copy to clipboard: {e}")
+    
+    def duplicate_history_item(self):
+        """Duplicate the selected history item."""
+        selection = self.history_listbox.curselection()
+        if not selection:
+            return
+            
+        # Set current project and get history manager
+        self.parent_gui.project_manager.set_current_project(self.project_id)
+        history_manager = self.parent_gui.project_manager.get_current_history_manager()
+        if not history_manager:
+            return
+            
+        index = selection[0]
+        previews = history_manager.get_prompt_previews()
+        
+        if index < len(previews):
+            prompt_id = previews[index]['id']
+            prompt_data = history_manager.get_prompt(prompt_id)
+            if prompt_data:
+                text = prompt_data['text']
+                title = prompt_data.get('title', '')
+                # Add " (Copy)" to the title
+                new_title = f"{title} (Copy)" if title else "Copy"
+                history_manager.add_prompt(text, self.file_indexer.root_path, new_title)
+                self.refresh_history()
+                self.parent_gui.status_text.set("History item duplicated")
+    
+    def on_index_updated(self):
+        """Called when file index is updated."""
+        self.parent_gui.root.after(0, self._update_project_info)
+        self.parent_gui.root.after(0, self.refresh_file_tree)
+        
+    def _update_project_info(self):
+        """Update project info display."""
+        if self.file_indexer.root_path:
+            file_count = self.file_indexer.get_indexed_files_count()
+            self.parent_gui.status_text.set(f"Ready - {file_count} files indexed")
+        else:
+            self.parent_gui.status_text.set("Ready")
+    
+    def on_index_progress(self, stats):
+        """Handle indexing progress updates."""
+        self.parent_gui.on_index_progress(stats)
+    
+    # Include all the text editor methods from the original class
+    def on_key_press(self, event):
+        """Handle key press events for navigation."""
+        if self.autocomplete_popup and self.autocomplete_popup.popup:
+            if event.keysym in ['Up', 'Down']:
+                if self.autocomplete_popup.move_selection(event.keysym.lower()):
+                    return 'break'
+        return None
+            
+    def on_key_release(self, event):
+        """Handle key release events for autocomplete."""
+        if event.keysym in ['Up', 'Down', 'Left', 'Right', 'Return', 'Escape']:
+            if event.keysym == 'Escape':
+                self.hide_autocomplete()
+            return
+            
+        self.update_statistics()
+        
+        if not self.render_mode.get():
+            self.check_autocomplete()
+    
+    def on_tab_press(self, event):
+        """Handle tab key press for autocomplete selection."""
+        if self.autocomplete_popup and self.autocomplete_popup.popup:
+            selected = self.autocomplete_popup.get_selected()
+            if selected:
+                self.insert_autocomplete_selection(selected)
+                return 'break'
+        return None
+    
+    def check_autocomplete(self):
+        """Check if we should show autocomplete."""
+        cursor_pos = self.text_editor.index(tk.INSERT)
+        text = self.text_editor.get('1.0', tk.END)
+        
+        cursor_char_idx = self.get_cursor_char_index(cursor_pos, text)
+        
+        at_info = self.content_processor.find_at_symbol_position(text, cursor_char_idx)
+        if at_info:
+            start_pos, end_pos, query = at_info
+            if query:
+                suggestions = self.file_indexer.search_files(query, limit=5)
+                if suggestions:
+                    try:
+                        x, y, _, _ = self.text_editor.bbox(tk.INSERT)
+                        x += self.text_editor.winfo_rootx()
+                        y += self.text_editor.winfo_rooty()
+                        
+                        self.autocomplete_popup.show(x, y, suggestions)
+                        return
+                    except tk.TclError:
+                        pass
+                    
+        self.hide_autocomplete()
+        
+    def get_cursor_char_index(self, cursor_pos, text):
+        """Convert tkinter cursor position to character index."""
+        lines = text.split('\n')
+        line_num, col_num = map(int, cursor_pos.split('.'))
+        
+        cursor_char_idx = 0
+        for i in range(line_num - 1):
+            if i < len(lines):
+                cursor_char_idx += len(lines[i]) + 1
+        cursor_char_idx += col_num
+        
+        return cursor_char_idx
+        
+    def insert_autocomplete_selection(self, selected_path):
+        """Insert the selected file path from autocomplete."""
+        cursor_pos = self.text_editor.index(tk.INSERT)
+        text = self.text_editor.get('1.0', tk.END)
+        cursor_char_idx = self.get_cursor_char_index(cursor_pos, text)
+        
+        at_info = self.content_processor.find_at_symbol_position(text, cursor_char_idx)
+        if at_info:
+            start_pos, end_pos, query = at_info
+
+            start_tk_pos = self.char_index_to_tk_pos(start_pos, text)
+            end_tk_pos = self.char_index_to_tk_pos(end_pos, text)
+
+            self.text_editor.delete(start_tk_pos, end_tk_pos)
+            self.text_editor.insert(start_tk_pos, selected_path)
+        else:
+            self.text_editor.insert(cursor_pos, selected_path)
+
+        self.hide_autocomplete()
+        
+    def char_index_to_tk_pos(self, char_idx, text):
+        """Convert character index to tkinter position."""
+        lines = text.split('\n')
+        current_char = 0
+        
+        for line_num, line in enumerate(lines):
+            if current_char + len(line) >= char_idx:
+                col = char_idx - current_char
+                return f"{line_num + 1}.{col}"
+            current_char += len(line) + 1
+            
+        return f"{len(lines)}.0"
+        
+    def hide_autocomplete(self, event=None):
+        """Hide the autocomplete popup."""
+        if self.autocomplete_popup:
+            self.autocomplete_popup.hide()
+    
+    def toggle_render_mode(self):
+        """Toggle between raw and rendered text mode."""
+        current_text = self.text_editor.get('1.0', tk.END).rstrip('\n')
+        
+        if self.render_mode.get():
+            self.raw_text = current_text
+            self.rendered_text = self.content_processor.process_content_for_copy(current_text)
+            
+            self.text_editor.delete('1.0', tk.END)
+            self.text_editor.insert('1.0', self.rendered_text)
+            
+            self.hide_autocomplete()
+            
+        else:
+            current_rendered = self.text_editor.get('1.0', tk.END).rstrip('\n')
+            
+            if current_rendered != self.rendered_text:
+                self.code_block_edits = self.content_processor.preserve_code_block_edits(current_rendered)
+                converted_raw = self.content_processor.convert_rendered_to_raw(current_rendered, self.raw_text)
+                
+                self.text_editor.delete('1.0', tk.END)
+                self.text_editor.insert('1.0', converted_raw)
+                
+                self.raw_text = converted_raw
+            else:
+                self.text_editor.delete('1.0', tk.END)
+                self.text_editor.insert('1.0', self.raw_text)
+        
+        self.update_statistics()
+            
+    def update_statistics(self):
+        """Update text statistics display."""
+        text = self.text_editor.get('1.0', tk.END)
+        
+        if self.render_mode.get() and self.raw_text:
+            stats = self.content_processor.get_text_statistics(self.raw_text)
+        else:
+            stats = self.content_processor.get_text_statistics(text)
+        
+        edit_count = len(self.code_block_edits)
+        edit_text = f" | Edits: {edit_count}" if edit_count > 0 else ""
+        
+        stats_text = f"Lines: {stats['lines']} | Words: {stats['words']} | Files: {stats['file_references']}{edit_text}"
+        self.stats_label.config(text=stats_text)
+        
+    def copy_with_content(self, event=None):
+        """Copy the text with file contents embedded."""
+        if self.render_mode.get():
+            processed_text = self.text_editor.get('1.0', tk.END).rstrip('\n')
+        else:
+            text = self.text_editor.get('1.0', tk.END)
+            processed_text = self.content_processor.process_content_for_copy(text, self.code_block_edits)
+        
+        try:
+            if CLIPBOARD_AVAILABLE:
+                pyperclip.copy(processed_text)
+                self.parent_gui.status_text.set("Copied to clipboard with file contents")
+                messagebox.showinfo("Success", "Content copied to clipboard!")
+            else:
+                self.parent_gui.show_processed_content(processed_text)
+                
+            # Create a new history item when copying (only if we don't have a current one)
+            if not self.current_history_id:
+                self.save_new_history_item()
+                
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to copy to clipboard: {e}")
+    
+    def save_new_history_item(self):
+        """Save current content as a new history item."""
+        if self.render_mode.get():
+            text = self.raw_text if self.raw_text else self.text_editor.get('1.0', tk.END).strip()
+        else:
+            text = self.text_editor.get('1.0', tk.END).strip()
+            
+        if not text:
+            return
+        
+        title = self.title_text.get().strip()
+        if not title:
+            title = "Untitled"
+        
+        # Set current project and get history manager
+        self.parent_gui.project_manager.set_current_project(self.project_id)
+        history_manager = self.parent_gui.project_manager.get_current_history_manager()
+        if history_manager:
+            self.current_history_id = history_manager.add_prompt(text, self.file_indexer.root_path, title)
+            self.last_saved_content = text
+            self.last_saved_title = title
+            self.refresh_history()
+            self.parent_gui.status_text.set("Saved to history")
+            
+    def clear_text(self):
+        """Clear the text editor."""
+        self.text_editor.delete('1.0', tk.END)
+        self.title_text.set("")
+        self.raw_text = ""
+        self.rendered_text = ""
+        self.code_block_edits = {}
+        self.render_mode.set(False)
+        self.current_history_id = None
+        self.last_saved_content = ""
+        self.last_saved_title = ""
+        self.update_statistics()
+        
+    def refresh_history(self):
+        """Refresh the history listbox."""
+        self.history_listbox.delete(0, tk.END)
+        
+        # Set current project and get history manager
+        self.parent_gui.project_manager.set_current_project(self.project_id)
+        history_manager = self.parent_gui.project_manager.get_current_history_manager()
+        if history_manager:
+            previews = history_manager.get_prompt_previews()
+            for preview in previews:
+                title = preview.get('title', '')
+                if title:
+                    display_text = f"{preview['created']} - {title}"
+                else:
+                    display_text = f"{preview['created']} - {preview['preview']}"
+                self.history_listbox.insert(tk.END, display_text)
+
+    def refresh_file_tree(self):
+        """Refresh the file tree view."""
+        if not hasattr(self, 'files_tree'):
+            return
+
+        self.files_tree.delete(*self.files_tree.get_children())
+
+        if not self.file_indexer.root_path:
+            return
+
+        paths = self.file_indexer.get_all_files()
+        tree_nodes = {'': ''}
+
+        for path in paths:
+            parts = path.split(os.sep)
+            parent_key = ''
+            for part in parts:
+                key = os.path.join(parent_key, part) if parent_key else part
+                if key not in tree_nodes:
+                    node = self.files_tree.insert(tree_nodes[parent_key], 'end', text=part, open=False)
+                    tree_nodes[key] = node
+                parent_key = key
+            
+    def load_from_history(self, event=None):
+        """Load selected item from history."""
+        selection = self.history_listbox.curselection()
+        if not selection:
+            return
+            
+        # Set current project and get history manager
+        self.parent_gui.project_manager.set_current_project(self.project_id)
+        history_manager = self.parent_gui.project_manager.get_current_history_manager()
+        if not history_manager:
+            return
+            
+        index = selection[0]
+        previews = history_manager.get_prompt_previews()
+        
+        if index < len(previews):
+            prompt_id = previews[index]['id']
+            prompt_data = history_manager.get_prompt(prompt_id)
+            if prompt_data:
+                text = prompt_data['text']
+                title = prompt_data.get('title', '')
+                
+                self.text_editor.delete('1.0', tk.END)
+                self.text_editor.insert('1.0', text)
+                self.title_text.set(title)
+                self.render_mode.set(False)
+                self.raw_text = text
+                self.rendered_text = ""
+                self.code_block_edits = {}
+                
+                # Set current history ID and save state
+                self.current_history_id = prompt_id
+                self.last_saved_content = text
+                self.last_saved_title = title
+                
+                self.update_statistics()
+                
+    def delete_from_history(self):
+        """Delete selected item from history."""
+        selection = self.history_listbox.curselection()
+        if not selection:
+            return
+            
+        # Set current project and get history manager
+        self.parent_gui.project_manager.set_current_project(self.project_id)
+        history_manager = self.parent_gui.project_manager.get_current_history_manager()
+        if not history_manager:
+            return
+            
+        if messagebox.askyesno("Confirm", "Delete selected history item?"):
+            index = selection[0]
+            previews = history_manager.get_prompt_previews()
+            
+            if index < len(previews):
+                prompt_id = previews[index]['id']
+                history_manager.delete_prompt(prompt_id)
+                self.refresh_history()
+
+    def on_file_double_click(self, event=None):
+        """Insert file path from tree into the prompt text."""
+        item = self.files_tree.focus()
+        if not item:
+            return
+
+        parts = []
+        while item and item != "":
+            parts.insert(0, self.files_tree.item(item, "text"))
+            item = self.files_tree.parent(item)
+
+        if parts:
+            file_path = os.path.join(*parts)
+            self.insert_autocomplete_selection(file_path)
 
 
 class AutocompletePopup:
@@ -281,7 +953,7 @@ class AutocompletePopup:
 
 
 class JContextGUI:
-    """Main GUI application class."""
+    """Main GUI application class with tabbed project interface."""
 
     def __init__(self):
         self.global_settings = GlobalSettings()
@@ -297,48 +969,48 @@ class JContextGUI:
         self.root.title("JContext - LLM Context Generator")
         self.root.geometry("1200x800")
 
-        default_family = self.global_settings.settings.get("font_family", "Arial")
-        default_size = int(self.global_settings.settings.get("font_size", 10))
-        try:
-            font.nametofont("TkDefaultFont").configure(family=default_family, size=default_size)
-            font.nametofont("TkTextFont").configure(family=default_family, size=default_size)
-            font.nametofont("TkMenuFont").configure(family=default_family, size=default_size)
-        except Exception:
-            pass
-
         # Initialize components
         self.project_manager = ProjectManager(self.global_settings)
-        self.file_indexer = FileIndexer()
-        self.content_processor = ContentProcessor(self.file_indexer)
-        self.autocomplete_popup = None
-
-        # Apply initial theme and menu styling now that components exist
+        
+        # Apply initial theme and menu styling
         self.apply_global_settings()
         
         # GUI state
-        self.current_project_path = tk.StringVar()
         self.status_text = tk.StringVar(value="Ready")
-        self.title_text = tk.StringVar()
-        self.render_mode = tk.BooleanVar(value=False)
-        
-        # Store text content for render mode switching
-        self.raw_text = ""
-        self.rendered_text = ""
-        self.code_block_edits = {}  # Store edits made to code blocks
         
         # Progress bar for indexing
         self.progress_var = tk.DoubleVar()
         self.progress_text = tk.StringVar(value="")
         
+        # Project tabs
+        self.project_tabs = {}  # project_id -> ProjectTab instance
+        
         # Set up GUI
         self.setup_gui()
         
-        # Set up callbacks
-        self.file_indexer.set_update_callback(self.on_index_updated)
-        self.file_indexer.set_progress_callback(self.on_index_progress)
+        # Load existing projects
+        self.load_existing_projects()
         
-        # Load the most recent project if available
-        self.load_most_recent_project()
+    def get_system_appropriate_font(self):
+        """Get a font that works well on the current system."""
+        import platform
+        
+        system = platform.system()
+        if system == "Linux":
+            # Common fonts that work well on Linux
+            linux_fonts = ["DejaVu Sans", "Liberation Sans", "Ubuntu", "Cantarell"]
+            for font_name in linux_fonts:
+                try:
+                    test_font = font.Font(family=font_name, size=10)
+                    if test_font.actual("family") == font_name:
+                        return font_name
+                except:
+                    continue
+            return "TkDefaultFont"  # Fallback to system default
+        elif system == "Darwin":  # macOS
+            return "SF Pro Display"
+        else:  # Windows
+            return "Segoe UI"
         
     def setup_gui(self):
         """Set up the main GUI components."""
@@ -349,18 +1021,8 @@ class JContextGUI:
         main_frame = ttk.Frame(self.root)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         
-        # Project selection frame
-        self.setup_project_frame(main_frame)
-        
-        # Content frame (horizontal split)
-        content_frame = ttk.PanedWindow(main_frame, orient=tk.HORIZONTAL)
-        content_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-        
-        # Left panel - text editor
-        self.setup_text_editor(content_frame)
-        
-        # Right panel - history and controls
-        self.setup_right_panel(content_frame)
+        # Project tabs notebook
+        self.setup_project_tabs(main_frame)
         
         # Status bar
         self.setup_status_bar()
@@ -374,11 +1036,13 @@ class JContextGUI:
         file_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="File", menu=file_menu)
         file_menu.add_command(label="New Project", command=self.select_new_project)
-        file_menu.add_command(label="Refresh Index", command=self.refresh_index)
+        file_menu.add_command(label="Refresh Index", command=self.refresh_current_index)
         file_menu.add_separator()
         file_menu.add_command(label="Settings", command=self.show_settings)
         file_menu.add_separator()
-        file_menu.add_command(label="Clear History", command=self.clear_history)
+        file_menu.add_command(label="Clear History", command=self.clear_current_history)
+        file_menu.add_separator()
+        file_menu.add_command(label="Close Tab", command=self.close_current_tab)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.root.quit)
         
@@ -387,753 +1051,492 @@ class JContextGUI:
         menubar.add_cascade(label="Help", menu=help_menu)
         help_menu.add_command(label="About", command=self.show_about)
         
-    def setup_project_frame(self, parent):
-        """Set up the project selection frame."""
-        project_frame = ttk.LabelFrame(parent, text="Project", padding=5)
-        project_frame.pack(fill=tk.X, pady=(0, 5))
+    def setup_project_tabs(self, parent):
+        """Set up the project tabs notebook."""
+        self.project_notebook = ttk.Notebook(parent)
+        self.project_notebook.pack(fill=tk.BOTH, expand=True)
         
-        # Project selection row
-        proj_select_frame = ttk.Frame(project_frame)
-        proj_select_frame.pack(fill=tk.X, pady=2)
+        # Create the "+" tab for adding new projects
+        self.add_new_tab_button()
         
-        ttk.Label(proj_select_frame, text="Project:").pack(side=tk.LEFT)
+        # Bind tab selection event
+        self.project_notebook.bind("<<NotebookTabChanged>>", self.on_tab_changed)
         
-        self.project_combo = ttk.Combobox(proj_select_frame, state='readonly', width=40)
-        self.project_combo.pack(side=tk.LEFT, padx=(5, 0), fill=tk.X, expand=True)
-        self.project_combo.bind('<<ComboboxSelected>>', self.on_project_selected)
+        # Bind right-click context menu
+        self.project_notebook.bind("<Button-3>", self.show_tab_context_menu)
         
-        ttk.Button(proj_select_frame, text="New Project", command=self.select_new_project).pack(side=tk.RIGHT, padx=(5, 0))
-        ttk.Button(proj_select_frame, text="Refresh", command=self.refresh_index).pack(side=tk.RIGHT, padx=(5, 0))
+        # Bind left-click for close button detection
+        self.project_notebook.bind("<Button-1>", self.on_tab_click)
         
-        # Current path display
-        ttk.Label(project_frame, text="Path:").pack(anchor=tk.W, pady=(5, 0))
-        self.path_entry = ttk.Entry(project_frame, textvariable=self.current_project_path, state='readonly')
-        self.path_entry.pack(fill=tk.X, pady=2)
+    def add_new_tab_button(self):
+        """Add a '+' button tab for creating new projects."""
+        # Create a dummy frame for the + tab
+        plus_frame = ttk.Frame(self.project_notebook)
+        self.project_notebook.add(plus_frame, text=" + ")
         
-        # Load projects into combo
-        self.refresh_project_list()
+        # Store reference to the plus tab
+        self.plus_tab_index = self.project_notebook.index("end") - 1
         
-    def setup_text_editor(self, parent):
-        """Set up the main text editor."""
-        editor_frame = ttk.Frame(parent)
-        parent.add(editor_frame, weight=3)
-        
-        # Title and prompt label on the same line
-        title_frame = ttk.Frame(editor_frame)
-        title_frame.pack(fill=tk.X, pady=(0, 5))
-
-        ttk.Label(title_frame, text="Title (optional):").pack(side=tk.LEFT)
-        self.title_entry = ttk.Entry(title_frame, textvariable=self.title_text, width=30)
-        self.title_entry.pack(side=tk.LEFT, padx=(5, 10))
-
-        ttk.Label(title_frame, text="Prompt Text (use @ to insert files):").pack(side=tk.LEFT)
-
-        # Render toggle will be placed with the control buttons
-        
-        # Text widget with scrollbar
-        text_frame = ttk.Frame(editor_frame)
-        text_frame.pack(fill=tk.BOTH, expand=True, pady=2)
-        
-        # Use global font settings
-        default_font = (
-            self.global_settings.settings.get("font_family", "Arial"),
-            int(self.global_settings.settings.get("font_size", 10))
-        )
-        
-        self.text_editor = scrolledtext.ScrolledText(
-            text_frame,
-            wrap=tk.WORD,
-            font=default_font,
-            undo=True
-        )
-        self.text_editor.pack(fill=tk.BOTH, expand=True)
-        
-        # Bind events for autocomplete and navigation
-        self.text_editor.bind('<KeyRelease>', self.on_key_release)
-        self.text_editor.bind('<KeyPress>', self.on_key_press)
-        self.text_editor.bind('<Button-1>', self.hide_autocomplete)
-        self.text_editor.bind('<Tab>', self.on_tab_press)
-        self.text_editor.bind('<Control-Return>', self.copy_with_content)
-        
-        # Control buttons
-        button_frame = ttk.Frame(editor_frame)
-        button_frame.pack(fill=tk.X, pady=5)
-
-        ttk.Button(button_frame, text="Copy with Content (Ctrl+Enter)",
-                  command=self.copy_with_content).pack(side=tk.LEFT)
-        ttk.Button(button_frame, text="Save to History",
-                  command=self.save_to_history).pack(side=tk.LEFT, padx=(5, 0))
-        ttk.Button(button_frame, text="Clear",
-                  command=self.clear_text).pack(side=tk.LEFT, padx=(5, 0))
-
-        # Render toggle aligned to the right
-        self.render_toggle = ttk.Checkbutton(
-            button_frame,
-            text="Render Mode",
-            variable=self.render_mode,
-            command=self.toggle_render_mode
-        )
-        self.render_toggle.pack(side=tk.RIGHT)
-
-        # Statistics
-        self.stats_label = ttk.Label(button_frame, text="")
-        self.stats_label.pack(side=tk.RIGHT, padx=(0, 10))
-        
-        # Set up autocomplete
-        self.autocomplete_popup = AutocompletePopup(self.root, self.text_editor)
-        
-    def setup_right_panel(self, parent):
-        """Set up the right panel with history and file tree."""
-        right_frame = ttk.Frame(parent)
-        parent.add(right_frame, weight=1)
-
-        notebook = ttk.Notebook(right_frame)
-        notebook.pack(fill=tk.BOTH, expand=True)
-
-        # History tab
-        history_tab = ttk.Frame(notebook)
-        notebook.add(history_tab, text="History")
-
-        list_frame = ttk.Frame(history_tab)
-        list_frame.pack(fill=tk.BOTH, expand=True)
-
-        self.history_listbox = tk.Listbox(list_frame)
-        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.history_listbox.yview)
-        self.history_listbox.configure(yscrollcommand=scrollbar.set)
-        self.history_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        self.history_listbox.bind('<Double-Button-1>', self.load_from_history)
-
-        hist_button_frame = ttk.Frame(history_tab)
-        hist_button_frame.pack(fill=tk.X, pady=5)
-
-        ttk.Button(hist_button_frame, text="Load",
-                  command=self.load_from_history).pack(side=tk.LEFT)
-        ttk.Button(hist_button_frame, text="Delete",
-                  command=self.delete_from_history).pack(side=tk.LEFT, padx=(5, 0))
-
-        # Files tab
-        files_tab = ttk.Frame(notebook)
-        notebook.add(files_tab, text="Files")
-
-        tree_frame = ttk.Frame(files_tab)
-        tree_frame.pack(fill=tk.BOTH, expand=True)
-
-        self.files_tree = ttk.Treeview(tree_frame, show='tree')
-        tree_scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.files_tree.yview)
-        self.files_tree.configure(yscrollcommand=tree_scroll.set)
-        self.files_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.files_tree.bind('<Double-Button-1>', self.on_file_double_click)
-
-        # Load history and file tree
-        self.refresh_history()
-        self.refresh_file_tree()
-        
-    def setup_status_bar(self):
-        """Set up the status bar."""
-        status_frame = ttk.Frame(self.root)
-        status_frame.pack(fill=tk.X, side=tk.BOTTOM)
-        
-        ttk.Label(status_frame, textvariable=self.status_text).pack(side=tk.LEFT, padx=5)
-        
-        # Progress bar for indexing
-        self.progress_frame = ttk.Frame(status_frame)
-        self.progress_frame.pack(side=tk.RIGHT, padx=5)
-        
-        self.progress_label = ttk.Label(self.progress_frame, textvariable=self.progress_text)
-        self.progress_label.pack(side=tk.LEFT, padx=(0, 5))
-        
-        self.progress_bar = ttk.Progressbar(self.progress_frame, variable=self.progress_var, length=200)
-        self.progress_bar.pack(side=tk.LEFT)
-        
-        # Cancel button for indexing
-        self.cancel_button = ttk.Button(self.progress_frame, text="Cancel", command=self.cancel_indexing)
-        self.cancel_button.pack(side=tk.LEFT, padx=(5, 0))
-        
-        # Initially hide progress components
-        self.progress_frame.pack_forget()
-        
-    def show_settings(self):
-        """Show the settings dialog."""
-        dialog = SettingsDialog(self.root, self.file_indexer, self.global_settings)
-        result = dialog.show()
-
-        if result:
-            # Save settings to current project
-            current_project = self.project_manager.get_current_project()
-            if current_project:
-                settings = {
-                    'ignored_dirs': list(self.file_indexer.ignored_dirs),
-                    'indexed_extensions': list(self.file_indexer.indexed_extensions)
-                }
-                self.project_manager.update_project_settings(current_project['id'], settings)
-            
-            self.project_manager.set_app_data_dir(self.global_settings.app_data_dir)
-            # Refresh index with new settings
-            self.apply_global_settings()
-            self.refresh_index()
-            self.status_text.set("Settings applied - index refreshed")
-        
-    def refresh_project_list(self):
-        """Refresh the project list in the combo box."""
-        projects = self.project_manager.get_project_list()
-        project_names = [f"{p['name']} ({p['path']})" for p in projects]
-        self.project_combo['values'] = project_names
-        
-        # Select current project if any
-        current_project = self.project_manager.get_current_project()
-        if current_project:
-            current_name = f"{current_project['name']} ({current_project['path']})"
-            if current_name in project_names:
-                self.project_combo.set(current_name)
-        
-    def on_project_selected(self, event=None):
-        """Handle project selection from combo box."""
-        selection = self.project_combo.get()
-        if not selection:
+    def on_tab_changed(self, event):
+        """Handle tab selection changes."""
+        selected_tab = self.project_notebook.select()
+        if not selected_tab:
             return
             
-        # Extract project path from selection
-        path_start = selection.rfind('(') + 1
-        path_end = selection.rfind(')')
-        if path_start > 0 and path_end > path_start:
-            project_path = selection[path_start:path_end]
-            
-            # Find project by path
-            project = self.project_manager.get_project_by_path(project_path)
-            if project:
-                self.load_project(project['id'])
+        current_index = self.project_notebook.index(selected_tab)
+        
+        # Check if the + tab was clicked
+        if current_index == self.plus_tab_index:
+            # User clicked the + tab, open new project dialog
+            self.select_new_project()
+            # Switch back to the previously selected tab if no new project was created
+            if len(self.project_tabs) > 0:
+                # Get the last project tab
+                for project_id, tab in self.project_tabs.items():
+                    tab_index = self.project_notebook.index(tab.tab_id)
+                    self.project_notebook.select(tab_index)
+                    break
     
+    def on_tab_click(self, event):
+        """Handle tab click events for close button detection."""
+        try:
+            tab_index = self.project_notebook.index("@%d,%d" % (event.x, event.y))
+        except tk.TclError:
+            return  # Click was not on a tab
+        
+        # Don't handle clicks on the + tab
+        if tab_index == self.plus_tab_index:
+            return
+        
+        # Find the project tab
+        clicked_project_id = None
+        for project_id, tab in self.project_tabs.items():
+            if self.project_notebook.index(tab.tab_id) == tab_index:
+                clicked_project_id = project_id
+                break
+        
+        if not clicked_project_id:
+            return
+        
+        # Get the tab text to check if close button was clicked
+        tab_text = self.project_notebook.tab(tab_index, "text")
+        
+        # Calculate approximate position of the ✕ symbol
+        # Only close if the click is very close to the ✕ position
+        tab_bbox = self.project_notebook.bbox(tab_index)
+        if tab_bbox:
+            tab_x, tab_y, tab_width, tab_height = tab_bbox
+            # Check if click is in the rightmost 15 pixels where ✕ would be
+            close_area_x = tab_x + tab_width - 15
+            if event.x >= close_area_x and "✕" in tab_text:
+                self.close_tab_by_id(clicked_project_id)
+                return "break"  # Prevent normal tab selection
+        
+        return None
+        
     def select_new_project(self):
         """Open dialog to select a new project directory."""
         directory = filedialog.askdirectory(title="Select Project Root Directory")
         if directory:
             # Create or update project
             project_id = self.project_manager.create_or_update_project(directory)
-            self.load_project(project_id)
-            self.refresh_project_list()
+            self.create_project_tab(project_id)
     
-    def load_project(self, project_id: str):
-        """Load a project by ID."""
-        if self.project_manager.set_current_project(project_id):
-            project = self.project_manager.get_current_project()
-            self.current_project_path.set(project['path'])
-            
-            # Apply project settings to file indexer
-            settings = project.get('settings', {})
-            if 'ignored_dirs' in settings:
-                if isinstance(settings['ignored_dirs'], list):
-                    self.file_indexer.ignored_dirs = set(settings['ignored_dirs'])
-                else:
-                    self.file_indexer.ignored_dirs = settings['ignored_dirs']
-            if 'indexed_extensions' in settings:
-                if isinstance(settings['indexed_extensions'], list):
-                    self.file_indexer.indexed_extensions = set(settings['indexed_extensions'])
-                else:
-                    self.file_indexer.indexed_extensions = settings['indexed_extensions']
-            
-            # Set file indexer root path and start indexing
-            if self.file_indexer.set_root_path(project['path']):
-                self.status_text.set(f"Indexing {project['name']}...")
-                self.show_progress()
-                
-                # Index in background
-                threading.Thread(target=self.file_indexer.refresh_index, daemon=True).start()
-            else:
-                messagebox.showerror("Error", "Failed to set project directory")
-                
-            # Refresh history for this project
-            self.refresh_history()
-        else:
-            messagebox.showerror("Error", "Failed to load project")
-                
-    def refresh_index(self):
-        """Refresh the file index."""
-        if not self.file_indexer.root_path:
-            messagebox.showwarning("Warning", "Please select a project first")
+    def create_project_tab(self, project_id):
+        """Create a new project tab."""
+        project_data = self.project_manager.get_project_by_id(project_id)
+        if not project_data:
+            messagebox.showerror("Error", "Failed to load project data")
+            return
+        
+        # Check if tab already exists
+        if project_id in self.project_tabs:
+            # Switch to existing tab
+            tab = self.project_tabs[project_id]
+            tab_index = self.project_notebook.index(tab.tab_id)
+            self.project_notebook.select(tab_index)
+            return
+        
+        # Create new project tab
+        project_tab = ProjectTab(self, project_id, project_data)
+        
+        # Create tab frame
+        tab_frame = ttk.Frame(self.project_notebook)
+        tab_content = project_tab.create_tab_content(tab_frame)
+        
+        # Create close button frame for the tab
+        close_frame = ttk.Frame(self.project_notebook)
+        project_name = os.path.basename(project_data['path'])
+        
+        # Add tab with close button text
+        tab_index = self.plus_tab_index
+        tab_text = f"{project_name} ✕"
+        self.project_notebook.insert(tab_index, tab_frame, text=tab_text)
+        
+        # Store tab reference
+        project_tab.tab_id = tab_frame
+        project_tab.project_name = project_name
+        self.project_tabs[project_id] = project_tab
+        
+        # Add to opened projects in settings
+        self.global_settings.add_opened_project(project_id)
+        
+        # Update plus tab index
+        self.plus_tab_index += 1
+        
+        # Select the new tab
+        self.project_notebook.select(tab_index)
+        
+        # Update status
+        self.status_text.set(f"Indexing {project_name}...")
+        self.show_progress()
+    
+    def close_current_tab(self):
+        """Close the currently selected project tab."""
+        selected_tab = self.project_notebook.select()
+        if not selected_tab:
             return
             
-        self.status_text.set("Refreshing index...")
-        self.show_progress()
+        current_index = self.project_notebook.index(selected_tab)
         
-        threading.Thread(target=self.file_indexer.refresh_index, daemon=True).start()
-    
-    def show_progress(self):
-        """Show the progress bar."""
-        self.progress_frame.pack(side=tk.RIGHT, padx=5)
-        self.progress_var.set(0)
-        self.progress_text.set("Starting...")
-    
-    def hide_progress(self):
-        """Hide the progress bar."""
-        self.progress_frame.pack_forget()
-        self.progress_var.set(0)
-        self.progress_text.set("")
-    
-    def cancel_indexing(self):
-        """Cancel the current indexing operation."""
-        self.file_indexer.cancel_indexing()
-        self.status_text.set("Indexing cancelled")
-    
-    def on_index_progress(self, stats):
-        """Handle indexing progress updates."""
-        def update_ui():
-            if 'error' in stats:
-                self.hide_progress()
-                self.status_text.set(f"Error: {stats['error']}")
-                messagebox.showerror("Indexing Error", f"Failed to index project:\n{stats['error']}")
-            elif 'cancelled' in stats:
-                self.hide_progress()
-                self.status_text.set("Indexing cancelled")
-            elif 'completed' in stats:
-                self.hide_progress()
-                # Will be updated by on_index_updated callback
+        # Don't close the + tab
+        if current_index == self.plus_tab_index:
+            return
+        
+        # Find which project tab this is
+        project_id_to_remove = None
+        for project_id, tab in self.project_tabs.items():
+            if tab.tab_id == selected_tab:
+                project_id_to_remove = project_id
+                break
+        
+        if project_id_to_remove:
+            # Remove tab
+            self.project_notebook.forget(current_index)
+            
+            # Remove from our tracking
+            del self.project_tabs[project_id_to_remove]
+            
+            # Remove from opened projects in settings
+            self.global_settings.remove_opened_project(project_id_to_remove)
+            
+            # Update plus tab index
+            self.plus_tab_index -= 1
+            
+            # Update status
+            if len(self.project_tabs) == 0:
+                self.status_text.set("Ready - No projects open")
             else:
-                total = stats.get('total_files', 0)
-                processed = stats.get('files_processed', 0)
-                current_dir = stats.get('current_dir', '')
-                
-                if total > 0:
-                    progress = (processed / total) * 100
-                    self.progress_var.set(progress)
-                    self.progress_text.set(f"{processed}/{total} files ({current_dir})")
-                else:
-                    self.progress_text.set(f"Scanning... ({current_dir})")
-        
-        # Schedule UI update on main thread
-        self.root.after(0, update_ui)
+                self.status_text.set("Ready")
     
-    def load_most_recent_project(self):
-        """Load the most recently accessed project."""
-        projects = self.project_manager.get_project_list()
-        if projects:
-            # Load the first project (most recent)
-            most_recent = projects[0]
-            if os.path.exists(most_recent['path']):
-                self.load_project(most_recent['id'])
+    def get_current_project_tab(self):
+        """Get the currently active project tab."""
+        selected_tab = self.project_notebook.select()
+        if not selected_tab:
+            return None
+            
+        current_index = self.project_notebook.index(selected_tab)
+        
+        # Check if it's the + tab
+        if current_index == self.plus_tab_index:
+            return None
+        
+        # Find the corresponding project tab
+        for project_id, tab in self.project_tabs.items():
+            if tab.tab_id == selected_tab:
+                return tab
+        
+        return None
+    
+    def load_existing_projects(self):
+        """Load existing projects as tabs."""
+        # Load projects that were previously opened
+        opened_projects = self.global_settings.get_opened_projects()
+        for project_id in opened_projects:
+            project = self.project_manager.get_project_by_id(project_id)
+            if project and os.path.exists(project['path']):
+                self.create_project_tab(project_id)
             else:
-                # Path doesn't exist anymore, remove from projects
-                self.project_manager.delete_project(most_recent['id'])
-                self.refresh_project_list()
+                # Path doesn't exist anymore, remove from projects and opened list
+                if project:
+                    self.project_manager.delete_project(project_id)
+                self.global_settings.remove_opened_project(project_id)
+    
+    def close_tab_by_id(self, project_id):
+        """Close a specific project tab by its ID."""
+        if project_id not in self.project_tabs:
+            return
+            
+        tab = self.project_tabs[project_id]
+        tab_index = self.project_notebook.index(tab.tab_id)
         
-    def on_index_updated(self):
-        """Called when file index is updated."""
-        self.root.after(0, self._update_project_info)
-        self.root.after(0, self.refresh_file_tree)
+        # Remove tab
+        self.project_notebook.forget(tab_index)
         
-    def _update_project_info(self):
-        """Update project info display."""
-        if self.file_indexer.root_path:
-            file_count = self.file_indexer.get_indexed_files_count()
-            self.status_text.set(f"Ready - {file_count} files indexed")
+        # Remove from our tracking
+        del self.project_tabs[project_id]
+        
+        # Remove from opened projects in settings
+        self.global_settings.remove_opened_project(project_id)
+        
+        # Update plus tab index
+        self.plus_tab_index -= 1
+        
+        # Update status
+        if len(self.project_tabs) == 0:
+            self.status_text.set("Ready - No projects open")
         else:
             self.status_text.set("Ready")
     
-    def on_key_press(self, event):
-        """Handle key press events for navigation."""
-        # Handle arrow keys for autocomplete navigation
-        if self.autocomplete_popup and self.autocomplete_popup.popup:
-            if event.keysym in ['Up', 'Down']:
-                if self.autocomplete_popup.move_selection(event.keysym.lower()):
-                    return 'break'  # Prevent default behavior
-        return None
-            
-    def on_key_release(self, event):
-        """Handle key release events for autocomplete."""
-        if event.keysym in ['Up', 'Down', 'Left', 'Right', 'Return', 'Escape']:
-            if event.keysym == 'Escape':
-                self.hide_autocomplete()
-            return
-            
-        # Update statistics
-        self.update_statistics()
-        
-        # Check for @ symbol autocomplete (only in raw mode)
-        if not self.render_mode.get():
-            self.check_autocomplete()
-        
-    def on_tab_press(self, event):
-        """Handle tab key press for autocomplete selection."""
-        if self.autocomplete_popup and self.autocomplete_popup.popup:
-            selected = self.autocomplete_popup.get_selected()
-            if selected:
-                self.insert_autocomplete_selection(selected)
-                return 'break'  # Prevent default tab behavior
-        return None
-        
-    def check_autocomplete(self):
-        """Check if we should show autocomplete."""
-        cursor_pos = self.text_editor.index(tk.INSERT)
-        text = self.text_editor.get('1.0', tk.END)
-        
-        # Convert cursor position to character index
-        cursor_char_idx = self.get_cursor_char_index(cursor_pos, text)
-        
-        # Check for @ query
-        at_info = self.content_processor.find_at_symbol_position(text, cursor_char_idx)
-        if at_info:
-            start_pos, end_pos, query = at_info
-            if query:  # Only show if there's a query
-                suggestions = self.file_indexer.search_files(query, limit=5)
-                if suggestions:
-                    # Get screen coordinates
-                    try:
-                        x, y, _, _ = self.text_editor.bbox(tk.INSERT)
-                        x += self.text_editor.winfo_rootx()
-                        y += self.text_editor.winfo_rooty()
-                        
-                        self.autocomplete_popup.show(x, y, suggestions)
-                        return
-                    except tk.TclError:
-                        pass  # Ignore if bbox fails
-                    
-        # Hide autocomplete if no @ query
-        self.hide_autocomplete()
-        
-    def get_cursor_char_index(self, cursor_pos, text):
-        """Convert tkinter cursor position to character index."""
-        lines = text.split('\n')
-        line_num, col_num = map(int, cursor_pos.split('.'))
-        
-        cursor_char_idx = 0
-        for i in range(line_num - 1):
-            if i < len(lines):
-                cursor_char_idx += len(lines[i]) + 1  # +1 for newline
-        cursor_char_idx += col_num
-        
-        return cursor_char_idx
-        
-    def insert_autocomplete_selection(self, selected_path):
-        """Insert the selected file path from autocomplete."""
-        cursor_pos = self.text_editor.index(tk.INSERT)
-        text = self.text_editor.get('1.0', tk.END)
-        cursor_char_idx = self.get_cursor_char_index(cursor_pos, text)
-        
-        # Find the @ query to replace
-        at_info = self.content_processor.find_at_symbol_position(text, cursor_char_idx)
-        if at_info:
-            start_pos, end_pos, query = at_info
-
-            # Convert character indices back to tkinter positions
-            start_tk_pos = self.char_index_to_tk_pos(start_pos, text)
-            end_tk_pos = self.char_index_to_tk_pos(end_pos, text)
-
-            # Replace the @query with the selected path
-            self.text_editor.delete(start_tk_pos, end_tk_pos)
-            self.text_editor.insert(start_tk_pos, selected_path)
-        else:
-            # No @ query, just insert at cursor
-            self.text_editor.insert(cursor_pos, selected_path)
-
-        self.hide_autocomplete()
-        
-    def char_index_to_tk_pos(self, char_idx, text):
-        """Convert character index to tkinter position."""
-        lines = text.split('\n')
-        current_char = 0
-        
-        for line_num, line in enumerate(lines):
-            if current_char + len(line) >= char_idx:
-                col = char_idx - current_char
-                return f"{line_num + 1}.{col}"
-            current_char += len(line) + 1  # +1 for newline
-            
-        return f"{len(lines)}.0"
-        
-    def hide_autocomplete(self, event=None):
-        """Hide the autocomplete popup."""
-        if self.autocomplete_popup:
-            self.autocomplete_popup.hide()
-    
-    def toggle_render_mode(self):
-        """Toggle between raw and rendered text mode."""
-        current_text = self.text_editor.get('1.0', tk.END).rstrip('\n')
-        
-        if self.render_mode.get():
-            # Switching to render mode
-            self.raw_text = current_text
-            self.rendered_text = self.content_processor.process_content_for_copy(current_text)
-            
-            # Update text editor with rendered content
-            self.text_editor.delete('1.0', tk.END)
-            self.text_editor.insert('1.0', self.rendered_text)
-            
-            # Disable autocomplete in render mode
-            self.hide_autocomplete()
-            
-        else:
-            # Switching back to raw mode
-            current_rendered = self.text_editor.get('1.0', tk.END).rstrip('\n')
-            
-            # Check if user made changes to rendered text
-            if current_rendered != self.rendered_text:
-                # User edited the rendered content - preserve edits and convert back to raw
-                self.code_block_edits = self.content_processor.preserve_code_block_edits(current_rendered)
-                converted_raw = self.content_processor.convert_rendered_to_raw(current_rendered, self.raw_text)
-                
-                self.text_editor.delete('1.0', tk.END)
-                self.text_editor.insert('1.0', converted_raw)
-                
-                # Update raw text to preserve the structure
-                self.raw_text = converted_raw
-            else:
-                # No changes, restore original raw text
-                self.text_editor.delete('1.0', tk.END)
-                self.text_editor.insert('1.0', self.raw_text)
-        
-        self.update_statistics()
-            
-    def update_statistics(self):
-        """Update text statistics display."""
-        text = self.text_editor.get('1.0', tk.END)
-        
-        # If in render mode, use raw text for statistics
-        if self.render_mode.get() and self.raw_text:
-            stats = self.content_processor.get_text_statistics(self.raw_text)
-        else:
-            stats = self.content_processor.get_text_statistics(text)
-        
-        # Add info about code block edits
-        edit_count = len(self.code_block_edits)
-        edit_text = f" | Edits: {edit_count}" if edit_count > 0 else ""
-        
-        stats_text = f"Lines: {stats['lines']} | Words: {stats['words']} | Files: {stats['file_references']}{edit_text}"
-        self.stats_label.config(text=stats_text)
-        
-    def copy_with_content(self, event=None):
-        """Copy the text with file contents embedded."""
-        if self.render_mode.get():
-            # In render mode, copy the current rendered text
-            processed_text = self.text_editor.get('1.0', tk.END).rstrip('\n')
-        else:
-            # In raw mode, process the text first
-            text = self.text_editor.get('1.0', tk.END)
-            processed_text = self.content_processor.process_content_for_copy(text, self.code_block_edits)
-        
+    def show_tab_context_menu(self, event):
+        """Show right-click context menu for project tabs."""
+        # Find which tab was right-clicked
         try:
-            if CLIPBOARD_AVAILABLE:
-                pyperclip.copy(processed_text)
-                self.status_text.set("Copied to clipboard with file contents")
-                messagebox.showinfo("Success", "Content copied to clipboard!")
+            tab_index = self.project_notebook.index("@%d,%d" % (event.x, event.y))
+        except tk.TclError:
+            return  # Click was not on a tab
+        
+        # Don't show context menu for + tab
+        if tab_index == self.plus_tab_index:
+            return
+        
+        # Find the project tab
+        clicked_tab = None
+        clicked_project_id = None
+        for project_id, tab in self.project_tabs.items():
+            if self.project_notebook.index(tab.tab_id) == tab_index:
+                clicked_tab = tab
+                clicked_project_id = project_id
+                break
+        
+        if not clicked_tab:
+            return
+        
+        # Create context menu
+        context_menu = tk.Menu(self.root, tearoff=0)
+        context_menu.add_command(
+            label="Refresh",
+            command=lambda: self.refresh_tab_index(clicked_project_id)
+        )
+        context_menu.add_separator()
+        context_menu.add_command(
+            label="Close",
+            command=lambda: self.close_tab_by_id(clicked_project_id)
+        )
+        context_menu.add_command(
+            label="Close Others",
+            command=lambda: self.close_other_tabs(clicked_project_id)
+        )
+        context_menu.add_command(
+            label="Close All",
+            command=self.close_all_tabs
+        )
+        
+        # Show the menu
+        try:
+            context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            context_menu.grab_release()
+    
+    def refresh_tab_index(self, project_id):
+        """Refresh the file index for a specific project tab."""
+        if project_id not in self.project_tabs:
+            return
+            
+        tab = self.project_tabs[project_id]
+        self.status_text.set("Refreshing index...")
+        self.show_progress()
+        
+        threading.Thread(target=tab.file_indexer.refresh_index, daemon=True).start()
+    
+    def close_other_tabs(self, keep_project_id):
+        """Close all tabs except the specified one."""
+        tabs_to_close = []
+        for project_id in self.project_tabs.keys():
+            if project_id != keep_project_id:
+                tabs_to_close.append(project_id)
+        
+        for project_id in tabs_to_close:
+            self.close_tab_by_id(project_id)
+    
+    def close_all_tabs(self):
+        """Close all project tabs."""
+        tabs_to_close = list(self.project_tabs.keys())
+        for project_id in tabs_to_close:
+            self.close_tab_by_id(project_id)
+        
+        # Clear all opened projects from settings
+        self.global_settings.set_opened_projects([])
+    
+    def apply_global_settings(self):
+        """Apply global settings like theme and font."""
+        try:
+            # Apply theme
+            theme = self.global_settings.settings.get("theme", "clam")
+            if hasattr(self.root, 'set_theme'):
+                self.root.set_theme(theme)
             else:
-                # Fallback: show in a new window
-                self.show_processed_content(processed_text)
+                style = ttk.Style(self.root)
+                available_themes = style.theme_names()
+                if theme in available_themes:
+                    style.theme_use(theme)
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to copy to clipboard: {e}")
-            
-    def show_processed_content(self, content):
-        """Show processed content in a new window."""
-        window = tk.Toplevel(self.root)
-        window.title("Processed Content")
-        window.geometry("800x600")
-        
-        text_widget = scrolledtext.ScrolledText(window, wrap=tk.WORD)
-        text_widget.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        text_widget.insert('1.0', content)
-        text_widget.config(state='disabled')
-        
-        # Copy button
-        def copy_from_window():
-            window.clipboard_clear()
-            window.clipboard_append(content)
-            messagebox.showinfo("Success", "Content copied to clipboard!")
-            
-        ttk.Button(window, text="Copy to Clipboard", command=copy_from_window).pack(pady=5)
-        
-    def save_to_history(self):
-        """Save current text to history."""
-        # Get the appropriate text to save
-        if self.render_mode.get():
-            text = self.raw_text if self.raw_text else self.text_editor.get('1.0', tk.END).strip()
+            print(f"Warning: Could not apply theme: {e}")
+    
+    def get_themes(self):
+        """Get available themes."""
+        try:
+            if hasattr(self.root, 'get_themes'):
+                return self.root.get_themes()
+            else:
+                style = ttk.Style(self.root)
+                return style.theme_names()
+        except Exception:
+            return ["clam", "alt", "default", "classic"]
+    
+    def show_settings(self):
+        """Show the settings dialog."""
+        current_tab = self.get_current_project_tab()
+        if current_tab:
+            dialog = SettingsDialog(self.root, current_tab.file_indexer, self.global_settings)
+            result = dialog.show()
+            if result:
+                # Apply new settings
+                self.apply_global_settings()
+                messagebox.showinfo("Settings", "Settings saved successfully!")
         else:
-            text = self.text_editor.get('1.0', tk.END).strip()
-            
-        if not text:
-            messagebox.showwarning("Warning", "No text to save")
-            return
-        
-        # Get title
-        title = self.title_text.get().strip()
-        
-        # Use current project's history manager
-        history_manager = self.project_manager.get_current_history_manager()
-        if history_manager:
-            history_manager.add_prompt(text, self.file_indexer.root_path, title)
-            self.refresh_history()
-            self.status_text.set("Saved to history")
+            messagebox.showwarning("Warning", "Please open a project first")
+    
+    def refresh_current_index(self):
+        """Refresh the index for the current project."""
+        current_tab = self.get_current_project_tab()
+        if current_tab:
+            self.status_text.set("Refreshing index...")
+            self.show_progress()
+            threading.Thread(target=current_tab.file_indexer.refresh_index, daemon=True).start()
         else:
             messagebox.showwarning("Warning", "No project selected")
-        
-    def clear_text(self):
-        """Clear the text editor."""
-        self.text_editor.delete('1.0', tk.END)
-        self.title_text.set("")
-        self.raw_text = ""
-        self.rendered_text = ""
-        self.code_block_edits = {}
-        self.render_mode.set(False)
-        self.update_statistics()
-        
-    def refresh_history(self):
-        """Refresh the history listbox."""
-        self.history_listbox.delete(0, tk.END)
-        
-        history_manager = self.project_manager.get_current_history_manager()
-        if history_manager:
-            previews = history_manager.get_prompt_previews()
-            for preview in previews:
-                title = preview.get('title', '')
-                if title:
-                    display_text = f"{preview['created']} - {title}"
-                else:
-                    display_text = f"{preview['created']} - {preview['preview']}"
-                self.history_listbox.insert(tk.END, display_text)
-
-    def refresh_file_tree(self):
-        """Refresh the file tree view."""
-        if not hasattr(self, 'files_tree'):
-            return
-
-        self.files_tree.delete(*self.files_tree.get_children())
-
-        if not self.file_indexer.root_path:
-            return
-
-        paths = self.file_indexer.get_all_files()
-        tree_nodes = {'': ''}
-
-        for path in paths:
-            parts = path.split(os.sep)
-            parent_key = ''
-            for part in parts:
-                key = os.path.join(parent_key, part) if parent_key else part
-                if key not in tree_nodes:
-                    node = self.files_tree.insert(tree_nodes[parent_key], 'end', text=part, open=False)
-                    tree_nodes[key] = node
-                parent_key = key
-            
-    def load_from_history(self, event=None):
-        """Load selected item from history."""
-        selection = self.history_listbox.curselection()
-        if not selection:
-            return
-            
-        history_manager = self.project_manager.get_current_history_manager()
-        if not history_manager:
-            return
-            
-        index = selection[0]
-        previews = history_manager.get_prompt_previews()
-        
-        if index < len(previews):
-            prompt_id = previews[index]['id']
-            prompt_data = history_manager.get_prompt(prompt_id)
-            if prompt_data:
-                text = prompt_data['text']
-                title = prompt_data.get('title', '')
-                
-                self.text_editor.delete('1.0', tk.END)
-                self.text_editor.insert('1.0', text)
-                self.title_text.set(title)
-                self.render_mode.set(False)
-                self.raw_text = text
-                self.rendered_text = ""
-                self.code_block_edits = {}
-                self.update_statistics()
-                
-    def delete_from_history(self):
-        """Delete selected item from history."""
-        selection = self.history_listbox.curselection()
-        if not selection:
-            return
-            
-        history_manager = self.project_manager.get_current_history_manager()
-        if not history_manager:
-            return
-            
-        if messagebox.askyesno("Confirm", "Delete selected history item?"):
-            index = selection[0]
-            previews = history_manager.get_prompt_previews()
-            
-            if index < len(previews):
-                prompt_id = previews[index]['id']
-                history_manager.delete_prompt(prompt_id)
-                self.refresh_history()
-                
-    def clear_history(self):
-        """Clear all history."""
-        history_manager = self.project_manager.get_current_history_manager()
-        if not history_manager:
+    
+    def clear_current_history(self):
+        """Clear history for the current project."""
+        current_tab = self.get_current_project_tab()
+        if current_tab:
+            if messagebox.askyesno("Confirm", "Clear all history for this project?"):
+                # Set current project and get history manager
+                self.project_manager.set_current_project(current_tab.project_id)
+                history_manager = self.project_manager.get_current_history_manager()
+                if history_manager:
+                    history_manager.clear_all()
+                    current_tab.refresh_history()
+                    self.status_text.set("History cleared")
+        else:
             messagebox.showwarning("Warning", "No project selected")
-            return
-
-        if messagebox.askyesno("Confirm", "Clear all history for current project?"):
-            history_manager.clear_history()
-            self.refresh_history()
-
-    def on_file_double_click(self, event=None):
-        """Insert file path from tree into the prompt text."""
-        item = self.files_tree.focus()
-        if not item:
-            return
-
-        parts = []
-        while item and item != "":
-            parts.insert(0, self.files_tree.item(item, "text"))
-            item = self.files_tree.parent(item)
-
-        if parts:
-            file_path = os.path.join(*parts)
-            self.insert_autocomplete_selection(file_path)
-            
+    
     def show_about(self):
         """Show about dialog."""
-        messagebox.showinfo("About",
-                           "JContext - LLM Context Generator\n\n"
-                           "A tool for creating LLM prompts with embedded file content.\n\n"
-                           "Features:\n"
-                           "• Use @ to insert files with autocomplete\n"
-                           "• Arrow keys to navigate suggestions\n"
-                           "• Render mode to preview/edit content\n"
-                           "• Configurable settings\n"
-                          "• Ctrl+Enter to copy content")
+        about_text = """JContext - LLM Context Generator
 
-    def apply_global_settings(self):
-        """Apply theme, fonts and storage directory from global settings."""
-        if ThemedTk and isinstance(self.root, ThemedTk):
-            try:
-                self.root.set_theme(self.global_settings.settings.get("theme", "clam"))
-            except Exception:
-                pass
-        else:
-            try:
-                style = ttk.Style(self.root)
-                style.theme_use(self.global_settings.settings.get("theme", "clam"))
-            except Exception:
-                pass
-        family = self.global_settings.settings.get("font_family", "Arial")
-        size = int(self.global_settings.settings.get("font_size", 10))
-        try:
-            font.nametofont("TkDefaultFont").configure(family=family, size=size)
-            font.nametofont("TkTextFont").configure(family=family, size=size)
-            font.nametofont("TkMenuFont").configure(family=family, size=size)
-        except Exception:
-            pass
+A tool for generating context-rich prompts for Large Language Models.
 
-        # Apply menu styling to match theme
-        try:
-            style = ttk.Style(self.root)
-            bg = style.lookup("TFrame", "background")
-            fg = style.lookup("TLabel", "foreground")
-            self.root.option_add("*Menu.background", bg)
-            self.root.option_add("*Menu.foreground", fg)
-            self.root.option_add("*Menu.font", font.nametofont("TkMenuFont"))
-        except Exception:
-            pass
-        self.project_manager.set_app_data_dir(self.global_settings.app_data_dir)
+Features:
+- File indexing and search
+- Autocomplete for file paths
+- Project management
+- History tracking with auto-save
+- Content processing
+
+Keyboard Shortcuts:
+- Ctrl+Shift+Enter: Copy content with file embedding
+- Tab: Select autocomplete suggestion  
+- Arrow keys: Navigate autocomplete
+- Double-click history: Load item
+- Right-click history: Context menu
+
+Version: 1.0
+"""
+        messagebox.showinfo("About JContext", about_text)
+    
+    def setup_status_bar(self):
+        """Set up the status bar."""
+        status_frame = ttk.Frame(self.root)
+        status_frame.pack(fill=tk.X, side=tk.BOTTOM)
         
+        # Status label
+        self.status_label = ttk.Label(status_frame, textvariable=self.status_text)
+        self.status_label.pack(side=tk.LEFT, padx=5, pady=2)
+        
+        # Progress bar (initially hidden)
+        self.progress_bar = ttk.Progressbar(
+            status_frame,
+            variable=self.progress_var,
+            mode='indeterminate'
+        )
+        
+        # Progress text label
+        self.progress_label = ttk.Label(status_frame, textvariable=self.progress_text)
+        self.progress_label.pack(side=tk.RIGHT, padx=5, pady=2)
+    
+    def show_progress(self):
+        """Show the progress bar."""
+        self.progress_bar.pack(side=tk.RIGHT, padx=5, pady=2)
+        self.progress_label.pack(side=tk.RIGHT, padx=5, pady=2)
+        self.progress_bar.start(10)
+    
+    def hide_progress(self):
+        """Hide the progress bar."""
+        self.progress_bar.stop()
+        self.progress_bar.pack_forget()
+        self.progress_label.pack_forget()
+        self.progress_text.set("")
+    
+    def on_index_progress(self, stats):
+        """Handle indexing progress updates."""
+        if stats.get('done', False):
+            self.root.after(0, self.hide_progress)
+            file_count = stats.get('total_files', 0)
+            self.root.after(0, lambda: self.status_text.set(f"Ready - {file_count} files indexed"))
+        else:
+            processed = stats.get('processed', 0)
+            total = stats.get('total', 0)
+            if total > 0:
+                self.root.after(0, lambda: self.progress_text.set(f"Indexing... {processed}/{total}"))
+    
+    def show_processed_content(self, content):
+        """Show processed content in a new window when clipboard is not available."""
+        content_window = tk.Toplevel(self.root)
+        content_window.title("Processed Content")
+        content_window.geometry("800x600")
+        
+        # Center the window
+        content_window.update_idletasks()
+        x = (content_window.winfo_screenwidth() // 2) - (800 // 2)
+        y = (content_window.winfo_screenheight() // 2) - (600 // 2)
+        content_window.geometry(f"800x600+{x}+{y}")
+        
+        main_frame = ttk.Frame(content_window, padding=10)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        ttk.Label(main_frame, text="Processed content (clipboard not available):").pack(anchor=tk.W, pady=(0, 5))
+        
+        text_widget = scrolledtext.ScrolledText(main_frame, wrap=tk.WORD)
+        text_widget.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        text_widget.insert('1.0', content)
+        text_widget.config(state=tk.DISABLED)
+        
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill=tk.X)
+        
+        def select_all():
+            text_widget.config(state=tk.NORMAL)
+            text_widget.tag_add(tk.SEL, "1.0", tk.END)
+            text_widget.mark_set(tk.INSERT, "1.0")
+            text_widget.see(tk.INSERT)
+            text_widget.config(state=tk.DISABLED)
+        
+        ttk.Button(button_frame, text="Select All", command=select_all).pack(side=tk.LEFT)
+        ttk.Button(button_frame, text="Close", command=content_window.destroy).pack(side=tk.RIGHT)
+
+    # ...existing code...
     def run(self):
         """Run the application."""
-        self.root.mainloop() 
+        self.root.mainloop()

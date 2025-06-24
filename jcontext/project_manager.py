@@ -124,6 +124,18 @@ class ProjectManager:
         """Get a specific project by ID."""
         return self.projects.get(project_id)
     
+    def get_project_by_id(self, project_id: str) -> Optional[Dict]:
+        """Get a specific project by ID (alias for get_project)."""
+        return self.get_project(project_id)
+    
+    def get_project_by_path(self, project_path: str) -> Optional[Dict]:
+        """Get a project by its path."""
+        normalized_path = os.path.normpath(os.path.abspath(project_path))
+        for project in self.projects.values():
+            if os.path.normpath(os.path.abspath(project['path'])) == normalized_path:
+                return project
+        return None
+    
     def set_current_project(self, project_id: str) -> bool:
         """Set the current active project."""
         if project_id in self.projects:
