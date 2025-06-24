@@ -404,24 +404,17 @@ class JContextGUI:
         editor_frame = ttk.Frame(parent)
         parent.add(editor_frame, weight=3)
         
-        # Title frame
+        # Title and prompt label on the same line
         title_frame = ttk.Frame(editor_frame)
         title_frame.pack(fill=tk.X, pady=(0, 5))
-        
+
         ttk.Label(title_frame, text="Title (optional):").pack(side=tk.LEFT)
         self.title_entry = ttk.Entry(title_frame, textvariable=self.title_text, width=30)
-        self.title_entry.pack(side=tk.LEFT, padx=(5, 0))
-        
-        # Render toggle
-        self.render_toggle = ttk.Checkbutton(
-            title_frame, 
-            text="Render Mode", 
-            variable=self.render_mode,
-            command=self.toggle_render_mode
-        )
-        self.render_toggle.pack(side=tk.RIGHT)
-        
-        ttk.Label(editor_frame, text="Prompt Text (use @ to insert files):").pack(anchor=tk.W)
+        self.title_entry.pack(side=tk.LEFT, padx=(5, 10))
+
+        ttk.Label(title_frame, text="Prompt Text (use @ to insert files):").pack(side=tk.LEFT)
+
+        # Render toggle will be placed with the control buttons
         
         # Text widget with scrollbar
         text_frame = ttk.Frame(editor_frame)
@@ -451,62 +444,77 @@ class JContextGUI:
         # Control buttons
         button_frame = ttk.Frame(editor_frame)
         button_frame.pack(fill=tk.X, pady=5)
-        
-        ttk.Button(button_frame, text="Copy with Content (Ctrl+Enter)", 
+
+        ttk.Button(button_frame, text="Copy with Content (Ctrl+Enter)",
                   command=self.copy_with_content).pack(side=tk.LEFT)
-        ttk.Button(button_frame, text="Save to History", 
+        ttk.Button(button_frame, text="Save to History",
                   command=self.save_to_history).pack(side=tk.LEFT, padx=(5, 0))
-        ttk.Button(button_frame, text="Clear", 
+        ttk.Button(button_frame, text="Clear",
                   command=self.clear_text).pack(side=tk.LEFT, padx=(5, 0))
-        
+
+        # Render toggle aligned to the right
+        self.render_toggle = ttk.Checkbutton(
+            button_frame,
+            text="Render Mode",
+            variable=self.render_mode,
+            command=self.toggle_render_mode
+        )
+        self.render_toggle.pack(side=tk.RIGHT)
+
         # Statistics
         self.stats_label = ttk.Label(button_frame, text="")
-        self.stats_label.pack(side=tk.RIGHT)
+        self.stats_label.pack(side=tk.RIGHT, padx=(0, 10))
         
         # Set up autocomplete
         self.autocomplete_popup = AutocompletePopup(self.root, self.text_editor)
         
     def setup_right_panel(self, parent):
-        """Set up the right panel with history and info."""
+        """Set up the right panel with history and file tree."""
         right_frame = ttk.Frame(parent)
         parent.add(right_frame, weight=1)
-        
-        # History section
-        history_frame = ttk.LabelFrame(right_frame, text="History", padding=5)
-        history_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # History listbox
-        list_frame = ttk.Frame(history_frame)
+
+        notebook = ttk.Notebook(right_frame)
+        notebook.pack(fill=tk.BOTH, expand=True)
+
+        # History tab
+        history_tab = ttk.Frame(notebook)
+        notebook.add(history_tab, text="History")
+
+        list_frame = ttk.Frame(history_tab)
         list_frame.pack(fill=tk.BOTH, expand=True)
-        
+
         self.history_listbox = tk.Listbox(list_frame)
         scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.history_listbox.yview)
         self.history_listbox.configure(yscrollcommand=scrollbar.set)
-        
         self.history_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
+
         self.history_listbox.bind('<Double-Button-1>', self.load_from_history)
-        
-        # History controls
-        hist_button_frame = ttk.Frame(history_frame)
+
+        hist_button_frame = ttk.Frame(history_tab)
         hist_button_frame.pack(fill=tk.X, pady=5)
-        
-        ttk.Button(hist_button_frame, text="Load", 
+
+        ttk.Button(hist_button_frame, text="Load",
                   command=self.load_from_history).pack(side=tk.LEFT)
-        ttk.Button(hist_button_frame, text="Delete", 
+        ttk.Button(hist_button_frame, text="Delete",
                   command=self.delete_from_history).pack(side=tk.LEFT, padx=(5, 0))
-        
-        # Info section
-        info_frame = ttk.LabelFrame(right_frame, text="Project Info", padding=5)
-        info_frame.pack(fill=tk.X, pady=(5, 0))
-        
-        self.info_label = ttk.Label(info_frame, text="No project selected", 
-                                   justify=tk.LEFT, anchor=tk.W)
-        self.info_label.pack(fill=tk.X)
-        
-        # Load history
+
+        # Files tab
+        files_tab = ttk.Frame(notebook)
+        notebook.add(files_tab, text="Files")
+
+        tree_frame = ttk.Frame(files_tab)
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.files_tree = ttk.Treeview(tree_frame, show='tree')
+        tree_scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.files_tree.yview)
+        self.files_tree.configure(yscrollcommand=tree_scroll.set)
+        self.files_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Load history and file tree
         self.refresh_history()
+        self.refresh_file_tree()
         
     def setup_status_bar(self):
         """Set up the status bar."""
@@ -698,15 +706,14 @@ class JContextGUI:
     def on_index_updated(self):
         """Called when file index is updated."""
         self.root.after(0, self._update_project_info)
+        self.root.after(0, self.refresh_file_tree)
         
     def _update_project_info(self):
         """Update project info display."""
         if self.file_indexer.root_path:
             file_count = self.file_indexer.get_indexed_files_count()
-            self.info_label.config(text=f"Files indexed: {file_count}")
             self.status_text.set(f"Ready - {file_count} files indexed")
         else:
-            self.info_label.config(text="No project selected")
             self.status_text.set("Ready")
     
     def on_key_press(self, event):
@@ -965,6 +972,29 @@ class JContextGUI:
                 else:
                     display_text = f"{preview['created']} - {preview['preview']}"
                 self.history_listbox.insert(tk.END, display_text)
+
+    def refresh_file_tree(self):
+        """Refresh the file tree view."""
+        if not hasattr(self, 'files_tree'):
+            return
+
+        self.files_tree.delete(*self.files_tree.get_children())
+
+        if not self.file_indexer.root_path:
+            return
+
+        paths = self.file_indexer.get_all_files()
+        tree_nodes = {'': ''}
+
+        for path in paths:
+            parts = path.split(os.sep)
+            parent_key = ''
+            for part in parts:
+                key = os.path.join(parent_key, part) if parent_key else part
+                if key not in tree_nodes:
+                    node = self.files_tree.insert(tree_nodes[parent_key], 'end', text=part, open=False)
+                    tree_nodes[key] = node
+                parent_key = key
             
     def load_from_history(self, event=None):
         """Load selected item from history."""
