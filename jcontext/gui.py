@@ -986,10 +986,16 @@ class JContextGUI:
         self.project_tabs = {}  # project_id -> ProjectTab instance
         
         # Set up GUI
+        # Flag to ignore the first tab changed event fired during initialization
+        self.ignore_initial_tab_event = True
+
         self.setup_gui()
-        
+
         # Load existing projects
         self.load_existing_projects()
+
+        # Allow tab changed events after initialization
+        self.ignore_initial_tab_event = False
         
     def get_system_appropriate_font(self):
         """Get a font that works well on the current system."""
@@ -1079,6 +1085,12 @@ class JContextGUI:
         
     def on_tab_changed(self, event):
         """Handle tab selection changes."""
+        # The notebook fires a tab changed event when it is first created.
+        # Ignore that initial event to avoid opening the project dialog
+        # before the user interacts with the UI.
+        if getattr(self, "ignore_initial_tab_event", False):
+            self.ignore_initial_tab_event = False
+            return
         selected_tab = self.project_notebook.select()
         if not selected_tab:
             return
@@ -1136,7 +1148,17 @@ class JContextGUI:
         
     def select_new_project(self):
         """Open dialog to select a new project directory."""
-        directory = filedialog.askdirectory(title="Select Project Root Directory")
+        # When the application is closing the root window might already be
+        # destroyed which would cause filedialog to raise a TclError.  Guard
+        # against that situation.
+        if not self.root.winfo_exists():
+            return
+        try:
+            directory = filedialog.askdirectory(
+                title="Select Project Root Directory"
+            )
+        except tk.TclError:
+            return
         if directory:
             # Create or update project
             project_id = self.project_manager.create_or_update_project(directory)
