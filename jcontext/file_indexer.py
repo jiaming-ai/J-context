@@ -142,8 +142,11 @@ class FileIndexer:
                         _, ext = os.path.splitext(name)
                         if ext.lower() in self.indexed_extensions or not ext:
                             rel_path = os.path.relpath(entry.path, self.root_path)
-                            self.file_index[name] = rel_path
-                            self.file_index[rel_path] = rel_path
+                            # Map filename to one or more relative paths
+                            self.file_index.setdefault(name, set()).add(rel_path)
+
+                            # Also index the full relative path for better matching
+                            self.file_index.setdefault(rel_path, set()).add(rel_path)
                             self._indexing_stats['files_processed'] += 1
                             if self._indexing_stats['files_processed'] % 50 == 0:
                                 self._report_progress()
