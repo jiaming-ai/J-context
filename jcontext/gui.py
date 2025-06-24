@@ -88,9 +88,9 @@ class SettingsDialog:
         theme_frame = ttk.LabelFrame(glob_tab, text="Theme and Font", padding=5)
         theme_frame.pack(fill=tk.X, pady=(0, 10))
         themes = []
-        if ThemedTk:
+        if hasattr(self.parent, "get_themes"):
             try:
-                themes = sorted(ThemedTk().get_themes())
+                themes = sorted(self.parent.get_themes())
             except Exception:
                 themes = []
         self.theme_var = tk.StringVar(value=self.global_settings.settings.get("theme", "clam"))
@@ -211,13 +211,23 @@ class AutocompletePopup:
             
         self.popup = tk.Toplevel(self.parent)
         self.popup.wm_overrideredirect(True)
-        self.popup.configure(bg='white', relief='solid', borderwidth=1)
+        style = ttk.Style(self.parent)
+        bg = style.lookup("TEntry", "fieldbackground") or "white"
+        fg = style.lookup("TEntry", "foreground") or "black"
+        self.popup.configure(bg=bg, relief='solid', borderwidth=1)
         
         # Position the popup
         self.popup.geometry(f"+{x}+{y+20}")
         
         # Create listbox
-        self.listbox = tk.Listbox(self.popup, height=min(len(suggestions), 5))
+        default_font = font.nametofont("TkTextFont")
+        self.listbox = tk.Listbox(
+            self.popup,
+            height=min(len(suggestions), 5),
+            bg=bg,
+            fg=fg,
+            font=default_font
+        )
         self.listbox.pack()
         
         # Add suggestions
@@ -292,6 +302,7 @@ class JContextGUI:
         try:
             font.nametofont("TkDefaultFont").configure(family=default_family, size=default_size)
             font.nametofont("TkTextFont").configure(family=default_family, size=default_size)
+            font.nametofont("TkMenuFont").configure(family=default_family, size=default_size)
         except Exception:
             pass
 
@@ -300,6 +311,9 @@ class JContextGUI:
         self.file_indexer = FileIndexer()
         self.content_processor = ContentProcessor(self.file_indexer)
         self.autocomplete_popup = None
+
+        # Apply initial theme and menu styling now that components exist
+        self.apply_global_settings()
         
         # GUI state
         self.current_project_path = tk.StringVar()
@@ -511,6 +525,7 @@ class JContextGUI:
         self.files_tree.configure(yscrollcommand=tree_scroll.set)
         self.files_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.files_tree.bind('<Double-Button-1>', self.on_file_double_click)
 
         # Load history and file tree
         self.refresh_history()
@@ -800,15 +815,18 @@ class JContextGUI:
         at_info = self.content_processor.find_at_symbol_position(text, cursor_char_idx)
         if at_info:
             start_pos, end_pos, query = at_info
-            
+
             # Convert character indices back to tkinter positions
             start_tk_pos = self.char_index_to_tk_pos(start_pos, text)
             end_tk_pos = self.char_index_to_tk_pos(end_pos, text)
-            
+
             # Replace the @query with the selected path
             self.text_editor.delete(start_tk_pos, end_tk_pos)
             self.text_editor.insert(start_tk_pos, selected_path)
-            
+        else:
+            # No @ query, just insert at cursor
+            self.text_editor.insert(cursor_pos, selected_path)
+
         self.hide_autocomplete()
         
     def char_index_to_tk_pos(self, char_idx, text):
@@ -1050,10 +1068,25 @@ class JContextGUI:
         if not history_manager:
             messagebox.showwarning("Warning", "No project selected")
             return
-            
+
         if messagebox.askyesno("Confirm", "Clear all history for current project?"):
             history_manager.clear_history()
             self.refresh_history()
+
+    def on_file_double_click(self, event=None):
+        """Insert file path from tree into the prompt text."""
+        item = self.files_tree.focus()
+        if not item:
+            return
+
+        parts = []
+        while item and item != "":
+            parts.insert(0, self.files_tree.item(item, "text"))
+            item = self.files_tree.parent(item)
+
+        if parts:
+            file_path = os.path.join(*parts)
+            self.insert_autocomplete_selection(file_path)
             
     def show_about(self):
         """Show about dialog."""
@@ -1085,6 +1118,18 @@ class JContextGUI:
         try:
             font.nametofont("TkDefaultFont").configure(family=family, size=size)
             font.nametofont("TkTextFont").configure(family=family, size=size)
+            font.nametofont("TkMenuFont").configure(family=family, size=size)
+        except Exception:
+            pass
+
+        # Apply menu styling to match theme
+        try:
+            style = ttk.Style(self.root)
+            bg = style.lookup("TFrame", "background")
+            fg = style.lookup("TLabel", "foreground")
+            self.root.option_add("*Menu.background", bg)
+            self.root.option_add("*Menu.foreground", fg)
+            self.root.option_add("*Menu.font", font.nametofont("TkMenuFont"))
         except Exception:
             pass
         self.project_manager.set_app_data_dir(self.global_settings.app_data_dir)
