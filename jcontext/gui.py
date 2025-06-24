@@ -289,7 +289,7 @@ class ProjectTab:
         self.text_editor.bind('<KeyPress>', self.on_key_press)
         self.text_editor.bind('<Button-1>', self.hide_autocomplete)
         self.text_editor.bind('<Tab>', self.on_tab_press)
-        self.text_editor.bind('<Control-Shift-Return>', self.copy_with_content)
+        self.text_editor.bind('<Control-Return>', self.copy_with_content)
         
         # Bind text change events for auto-save
         self.title_text.trace('w', self.on_text_changed)
@@ -298,7 +298,7 @@ class ProjectTab:
         button_frame = ttk.Frame(editor_frame)
         button_frame.pack(fill=tk.X, pady=5)
 
-        ttk.Button(button_frame, text="Copy with Content (Ctrl+Shift+Enter)",
+        ttk.Button(button_frame, text="Copy with Content (Ctrl+Enter)",
                   command=self.copy_with_content).pack(side=tk.LEFT)
         ttk.Button(button_frame, text="New",
                   command=self.new_prompt).pack(side=tk.LEFT, padx=(5, 0))
@@ -1138,9 +1138,15 @@ class JContextGUI:
         tab_bbox = self.project_notebook.bbox(tab_index)
         if tab_bbox:
             tab_x, tab_y, tab_width, tab_height = tab_bbox
-            # Check if click is in the rightmost 15 pixels where ✕ would be
-            close_area_x = tab_x + tab_width - 15
-            if event.x >= close_area_x and "✕" in tab_text:
+            rel_x = event.x - tab_x
+            rel_y = event.y - tab_y
+            close_size = 12  # size of the close area square
+            if (
+                0 <= rel_x <= tab_width
+                and 0 <= rel_y <= tab_height
+                and tab_width - rel_x <= close_size
+                and "✕" in tab_text
+            ):
                 self.close_tab_by_id(clicked_project_id)
                 return "break"  # Prevent normal tab selection
         
@@ -1468,7 +1474,7 @@ Features:
 - Content processing
 
 Keyboard Shortcuts:
-- Ctrl+Shift+Enter: Copy content with file embedding
+- Ctrl+Enter: Copy content with file embedding
 - Tab: Select autocomplete suggestion  
 - Arrow keys: Navigate autocomplete
 - Double-click history: Load item
