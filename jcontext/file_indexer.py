@@ -7,7 +7,7 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import List, Dict, Optional, Callable
+from typing import List, Dict, Optional, Callable, Set
 
 
 class FileIndexer:
@@ -15,7 +15,9 @@ class FileIndexer:
     
     def __init__(self, root_path: Optional[str] = None):
         self.root_path = root_path
-        self.file_index: Dict[str, str] = {}  # filename -> full_path
+        # Map of search keys (filename or relative path) to a set of file paths
+        # A filename may map to multiple files in different directories.
+        self.file_index: Dict[str, Set[str]] = {}
         self.last_updated = 0
         self.update_callback: Optional[Callable] = None
         self.progress_callback: Optional[Callable] = None
@@ -144,10 +146,12 @@ class FileIndexer:
                     if ext.lower() in self.indexed_extensions or not ext:
                         # Store relative path from root
                         rel_path = os.path.relpath(item_path, self.root_path)
-                        self.file_index[item] = rel_path
-                        
-                        # Also index the full path for better matching
-                        self.file_index[rel_path] = rel_path
+
+                        # Map filename to one or more relative paths
+                        self.file_index.setdefault(item, set()).add(rel_path)
+
+                        # Also index the full relative path for better matching
+                        self.file_index.setdefault(rel_path, set()).add(rel_path)
                         
                         # Update progress
                         self._indexing_stats['files_processed'] += 1
@@ -184,19 +188,20 @@ class FileIndexer:
             except re.error:
                 use_regex = False
             
-            for filename, filepath in self.file_index.items():
-                # Exact match (case insensitive)
-                if filename.lower() == query.lower():
-                    exact_matches.append(filepath)
-                # Prefix match
-                elif filename.lower().startswith(query.lower()):
-                    prefix_matches.append(filepath)
-                # Contains match
-                elif query.lower() in filename.lower():
-                    contains_matches.append(filepath)
-                # Regex match
-                elif use_regex and pattern.search(filename):
-                    regex_matches.append(filepath)
+            for key, paths in self.file_index.items():
+                for filepath in paths:
+                    # Exact match (case insensitive)
+                    if key.lower() == query.lower():
+                        exact_matches.append(filepath)
+                    # Prefix match
+                    elif key.lower().startswith(query.lower()):
+                        prefix_matches.append(filepath)
+                    # Contains match
+                    elif query.lower() in key.lower():
+                        contains_matches.append(filepath)
+                    # Regex match
+                    elif use_regex and pattern.search(key):
+                        regex_matches.append(filepath)
             
             # Combine results in order of preference
             matches.extend(exact_matches[:limit])
@@ -279,4 +284,7 @@ class FileIndexer:
     
     def get_indexed_files_count(self) -> int:
         """Get the number of indexed files."""
-        return len(self.file_index) // 2  # Divide by 2 because we store both filename and filepath 
+        unique_paths: Set[str] = set()
+        for paths in self.file_index.values():
+            unique_paths.update(paths)
+        return len(unique_paths)
