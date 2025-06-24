@@ -1,6 +1,7 @@
 import os
 import tempfile
 from jcontext.project_manager import ProjectManager
+from jcontext.global_settings import GlobalSettings
 
 
 def test_create_and_load_project():
@@ -8,7 +9,8 @@ def test_create_and_load_project():
         orig_home = os.environ.get('HOME')
         os.environ['HOME'] = home
         try:
-            pm = ProjectManager()
+            gs = GlobalSettings(root_dir=home)
+            pm = ProjectManager(gs)
             proj_dir = tempfile.mkdtemp(dir=home)
             pid = pm.create_or_update_project(proj_dir)
             assert pid in pm.projects

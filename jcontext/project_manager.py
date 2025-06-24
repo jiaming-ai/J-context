@@ -8,13 +8,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional, Any
 from .history_manager import HistoryManager
+from .global_settings import GlobalSettings
 
 
 class ProjectManager:
     """Manages project organization and persistent storage."""
-    
-    def __init__(self):
-        self.app_data_dir = self._get_app_data_dir()
+
+    def __init__(self, global_settings: Optional[GlobalSettings] = None):
+        self.global_settings = global_settings or GlobalSettings()
+        self.app_data_dir = self.global_settings.app_data_dir
         self.projects_file = os.path.join(self.app_data_dir, "projects.json")
         self.projects: Dict[str, Dict] = {}
         self.current_project_id: Optional[str] = None
@@ -62,6 +64,15 @@ class ProjectManager:
                 json.dump(self.projects, f, indent=2, ensure_ascii=False)
         except Exception as e:
             print(f"Error saving projects: {e}")
+
+    def set_app_data_dir(self, path: str):
+        """Change the app data directory and reload projects."""
+        if not path:
+            return
+        self.app_data_dir = path
+        self.projects_file = os.path.join(self.app_data_dir, "projects.json")
+        os.makedirs(self.app_data_dir, exist_ok=True)
+        self.load_projects()
     
     def create_or_update_project(self, project_path: str, name: Optional[str] = None) -> str:
         """Create a new project or update existing one."""
@@ -80,18 +91,9 @@ class ProjectManager:
             "created": datetime.now().isoformat(),
             "last_accessed": datetime.now().isoformat(),
             "settings": {
-                "ignored_dirs": [
-                    '__pycache__', '.git', '.svn', '.hg', '.vscode', '.idea',
-                    'node_modules', '.env', 'venv', '.venv', 'env', 'ENV',
-                    'dist', 'build', 'target', 'bin', 'obj', '.pytest_cache'
-                ],
-                "indexed_extensions": [
-                    '.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.cpp', '.c', '.h',
-                    '.cs', '.php', '.rb', '.go', '.rs', '.swift', '.kt', '.scala',
-                    '.html', '.css', '.scss', '.less', '.xml', '.json', '.yaml', '.yml',
-                    '.md', '.txt', '.rst', '.sql', '.sh', '.bat', '.ps1', '.r', '.m'
-                ]
-            }
+                "ignored_dirs": self.global_settings.default_ignored_dirs,
+                "indexed_extensions": self.global_settings.default_indexed_extensions,
+            },
         }
         
         # Update if project already exists
