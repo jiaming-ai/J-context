@@ -95,69 +95,76 @@ class FileIndexer:
                     self.progress_callback({'completed': True})
     
     def _count_files(self, path: str) -> int:
-        """Count total files for progress tracking."""
+        """Count total files for progress tracking using scandir for speed."""
         count = 0
         try:
-            for item in os.listdir(path):
-                if self._cancel_indexing:
-                    break
-                    
-                if item.startswith('.') and item not in {'.gitignore', '.env.example'}:
-                    continue
-                    
-                item_path = os.path.join(path, item)
-                
-                if os.path.isdir(item_path):
-                    if item not in self.ignored_dirs:
-                        count += self._count_files(item_path)
-                elif os.path.isfile(item_path):
-                    _, ext = os.path.splitext(item)
-                    if ext.lower() in self.indexed_extensions or not ext:
-                        count += 1
+            with os.scandir(path) as it:
+                for entry in it:
+                    if self._cancel_indexing:
+                        break
+
+                    name = entry.name
+                    if name.startswith('.') and name not in {'.gitignore', '.env.example'}:
+                        continue
+
+                    if entry.is_dir(follow_symlinks=False):
+                        if name not in self.ignored_dirs:
+                            count += self._count_files(entry.path)
+                    elif entry.is_file(follow_symlinks=False):
+                        _, ext = os.path.splitext(name)
+                        if ext.lower() in self.indexed_extensions or not ext:
+                            count += 1
         except PermissionError:
             pass
         return count
     
     def _build_index(self, path: str):
-        """Recursively build the file index."""
+        """Recursively build the file index using scandir."""
         try:
-            # Update progress with current directory
-            if self.progress_callback:
-                rel_path = os.path.relpath(path, self.root_path) if path != self.root_path else "."
-                self._indexing_stats['current_dir'] = rel_path
-                if self._indexing_stats['files_processed'] % 50 == 0:  # Update every 50 files
-                    self.progress_callback(self._indexing_stats.copy())
-            
-            for item in os.listdir(path):
-                if self._cancel_indexing:
-                    break
-                    
-                if item.startswith('.') and item not in {'.gitignore', '.env.example'}:
-                    continue
-                    
-                item_path = os.path.join(path, item)
-                
-                if os.path.isdir(item_path):
-                    if item not in self.ignored_dirs:
-                        self._build_index(item_path)
-                elif os.path.isfile(item_path):
-                    # Check if file has an indexed extension
-                    _, ext = os.path.splitext(item)
-                    if ext.lower() in self.indexed_extensions or not ext:
-                        # Store relative path from root
-                        rel_path = os.path.relpath(item_path, self.root_path)
+            rel_path = os.path.relpath(path, self.root_path) if path != self.root_path else "."
+            self._indexing_stats['current_dir'] = rel_path
+            if self._indexing_stats['files_processed'] % 50 == 0:
+                self._report_progress()
 
-                        # Map filename to one or more relative paths
-                        self.file_index.setdefault(item, set()).add(rel_path)
+            with os.scandir(path) as it:
+                for entry in it:
+                    if self._cancel_indexing:
+                        break
 
-                        # Also index the full relative path for better matching
-                        self.file_index.setdefault(rel_path, set()).add(rel_path)
-                        
-                        # Update progress
-                        self._indexing_stats['files_processed'] += 1
-                        
+                    name = entry.name
+                    if name.startswith('.') and name not in {'.gitignore', '.env.example'}:
+                        continue
+
+                    if entry.is_dir(follow_symlinks=False):
+                        if name not in self.ignored_dirs:
+                            self._build_index(entry.path)
+                    elif entry.is_file(follow_symlinks=False):
+                        _, ext = os.path.splitext(name)
+                        if ext.lower() in self.indexed_extensions or not ext:
+                            rel_path = os.path.relpath(entry.path, self.root_path)
+                            self.file_index[name] = rel_path
+                            self.file_index[rel_path] = rel_path
+                            self._indexing_stats['files_processed'] += 1
+                            if self._indexing_stats['files_processed'] % 50 == 0:
+                                self._report_progress()
+
+
         except PermissionError:
             pass  # Skip directories we can't access
+
+    def _report_progress(self):
+        """Report progress either via callback or stdout."""
+        if self.progress_callback:
+            self.progress_callback(self._indexing_stats.copy())
+        else:
+            total = self._indexing_stats.get('total_files', 0)
+            processed = self._indexing_stats.get('files_processed', 0)
+            current = self._indexing_stats.get('current_dir', '')
+            if total:
+                percent = (processed / total) * 100
+                print(f"Indexing {processed}/{total} files ({percent:.1f}%) - {current}", end='\r', flush=True)
+            else:
+                print(f"Indexing... ({current})", end='\r', flush=True)
     
     def search_files(self, query: str, limit: int = 3) -> List[str]:
         """Search for files matching the query."""
