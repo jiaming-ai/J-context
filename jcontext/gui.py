@@ -1234,7 +1234,7 @@ class JContextGUI:
         # Find which project tab this is
         project_id_to_remove = None
         for project_id, tab in self.project_tabs.items():
-            if tab.tab_id == selected_tab:
+            if str(tab.tab_id) == str(selected_tab):
                 project_id_to_remove = project_id
                 break
         
@@ -1271,7 +1271,7 @@ class JContextGUI:
         
         # Find the corresponding project tab
         for project_id, tab in self.project_tabs.items():
-            if tab.tab_id == selected_tab:
+            if str(tab.tab_id) == str(selected_tab):
                 return tab
         
         return None
